@@ -1,0 +1,109 @@
+======== NOTICE of the original work, reproduced unchanged ========
+
+Grok Build Plugin for Claude Code
+Copyright 2026 xAI
+
+Layout inspiration for the Claude Code marketplace plugin structure draws briefly
+from community plugin packaging patterns; the product surface, commands, and
+runtime here are Grok-native and shell out to the Grok Build CLI.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--------------------------------------------------------------------------------
+
+======== NOTICE of this derivative work ========
+
+This repository is a modified fork of xAI's grok-build Claude Code plugin
+(the original work above). The original is licensed under the Apache License,
+Version 2.0. Modifications to this fork are Copyright 2026 Kai Wedekind and are
+released under that same License.
+
+Everything above the separator is xAI's text, retained because the License
+requires it. It speaks in the original author's voice and describes the original
+work, not this one — in particular, "the product surface, commands, and runtime
+here" refers to xAI's plugin.
+
+Notice of modification, per Apache License 2.0 section 4(b): the upstream baseline
+is xai-org/grok-build-plugin-cc at commit 5a9f924. Every file in this repository
+that differs from that commit, including those added since, was modified or
+written by Kai Wedekind in 2026; the files byte-identical to it are reproduced
+unaltered and carry no change of this fork — among them LICENSE, which is the
+stock Apache License 2.0 text. The fork's history was condensed into a single
+commit for publication, so 5a9f924 resolves in the upstream repository rather than
+here; diffing this tree against it there is the exact list. Each source file that
+existed at 5a9f924 and differs from it now also carries the notice in its own
+header, per the literal wording of 4(b); files this fork added carry none, because
+they are new works rather than modified ones, and files byte-identical to upstream
+carry none because nothing in them changed. CHANGELOG.md names what changed and why.
+
+Grok, Grok Build, SuperGrok, X and SpaceXAI are trademarks of xAI, which merged
+into SpaceX and was rebranded SpaceXAI in 2026. Claude, Claude Code and Anthropic
+are trademarks of Anthropic. Every other product or company name appearing in this
+repository belongs to its respective owner, and every mark named here stays with
+its owner or that owner's successors through any renaming, merger or acquisition.
+This License grants no trademark rights in any direction (Apache License 2.0
+section 6).
+
+X is named in the documentation to say which service a search reaches, because Claude
+Code cannot reach it and Grok can. That is nominative use — identifying somebody else's
+product by its own name in order to describe what this software talks to. It is not a
+claim of association with, sponsorship by, or endorsement from the owner of that mark,
+and nothing in this project is affiliated with or approved by them. The same applies to
+every other mark listed above wherever it appears here.
+
+The company names above are the owners as of writing; what is meant to carry
+forward is the successor clause, not the name. The 2026 merger of xAI into SpaceX
+and the rebrand to SpaceXAI are stated above as the fact they are; what is
+deliberately not asserted is which entity inside that group holds each of the marks
+today. Nor is there any mismatch with the block above the separator: that
+text says "Copyright 2026 xAI" because the License requires it reproduced
+unchanged, and it names the publisher as it was at the time.
+
+Both are named here because this project sits between them, and a bridge cannot
+avoid saying what it bridges: the plugin keeps the functional name grok-build
+because that is the CLI it drives, and it calls itself a Claude Code plugin
+because that is the host it runs inside. Neither name is a claim to either.
+
+It is not an xAI product and carries no endorsement by xAI. It is not an Anthropic
+product and carries no endorsement by Anthropic. It is an independent fork
+maintained by Kai Wedekind, and its only relationship to either company is that it
+invokes software they publish.
+
+Four ideas in this fork came from elsewhere and are named here as well as in the
+comments where they are used:
+
+  tylersue/claude-grok-delegation (MIT) — the shape of the read-only barrier:
+  confining the agent at the tool layer, with deny rules alongside, rather than
+  relying on the sandbox, and the practice of stating out loud when a requested
+  confinement layer is not actually enforced. No code was copied. That project
+  pairs a positive allowlist with its deny rules; this fork instead removes the
+  shell and file-edit tools outright, together with the two MCP meta-tools that
+  could reach a writing server. It also does not fail open when the sandbox is
+  unavailable, and it keeps web_search available in read-only runs. The reasoning,
+  not the implementation, is what was borrowed.
+
+  tylersue/claude-grok-delegation (MIT), a second time — for pointing out that the
+  grok CLI has a telemetry and trace-upload channel of its own, separate from
+  inference and untouched by any bridge. SECURITY.md documents it because of that
+  project. The switches listed there were verified against the installed CLI rather
+  than copied, and the wording is this fork's own.
+
+  xai-org/grok-build-plugin-cc issue #4, "Untracked-file review context follows
+  symlinks, leaking out-of-repo file contents to the model" — reported upstream by
+  GitHub user oneshot2001 on 2026-07-16. This fork carried the same defect and
+  fixed it after reading that report. The fix here is its own; the problem was not.
+
+  xai-org/grok-build-plugin-cc issue #3, "`stop` kills process trees before
+  confirming its cancellation claim (completed / PID-reuse race)" — reported by the
+  same author on the same day. The condition it names was wrong here too, and the
+  fix in this fork is its own.

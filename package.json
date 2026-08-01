@@ -1,0 +1,25 @@
+{
+  "name": "claude-code-grok-bridge",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Fork of the Claude Code ↔ Grok Build bridge for review, critique, and delegation.",
+  "author": "Kai Wedekind",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/kai-wedekind/claude-code-grok-bridge",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kai-wedekind/claude-code-grok-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kai-wedekind/claude-code-grok-bridge/issues"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "bump-version": "node scripts/bump-version.mjs",
+    "check-version": "node scripts/bump-version.mjs --check",
+    "test": "node scripts/run-tests.mjs"
+  }
+}

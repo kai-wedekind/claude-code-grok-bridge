@@ -1,0 +1,100 @@
+name: tests
+
+# ⚠ Runner minutes are not free, and the multipliers are what make this expensive: a
+# Windows minute bills as two, a macOS minute as ten, and every job is rounded up to a
+# whole minute. So a nine-cell matrix that finishes in five minutes of wall clock bills
+# closer to fifty (rates as of 2026-08-01). Against GitHub's 2,000-minute monthly free
+# allowance that is not an abstract concern: a single day of documentation edits can
+# exhaust it, and every one of those runs proves nothing, because the pushes changed prose.
+#
+# Hence the filters. A change that cannot affect a test does not get a test run.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'docs/**'
+  # Run it by hand from the Actions tab. Useful when the suite has not run against a
+  # commit for a reason unrelated to the code — a docs-only push, or a period when the
+  # account's runner minutes were exhausted — and the tree deserves a verdict anyway.
+  workflow_dispatch:
+
+# Least privilege, stated rather than inherited. On a public repository the default
+# workflow permission is a repository-wide setting, so a job that runs contributed test
+# code — and this suite spawns processes and creates symlinks — could inherit a
+# write-capable token without anyone having chosen that. Note the trigger is
+# `pull_request`, not `pull_request_target`: a fork's code never runs with access to this
+# repository's secrets, which is why the matrix below is safe to run on contributions.
+permissions:
+  contents: read
+
+# A superseded run has nothing left to prove, and on these multipliers it is not cheap
+# to let it finish anyway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # All three platforms matter, and each for its own reason.
+    #
+    # Windows: the fork exists largely because it behaves differently here — no sandbox
+    # enforcement, PATHEXT resolution, no shell spawn.
+    #
+    # macOS was added 2026-08-01 for a specific untested path, not for symmetry.
+    # `readProcessImageName` reads /proc/<pid>/exe first and falls back to `ps -o comm=`;
+    # the comment there names the case exactly ("No /proc — macOS, BSD, or a hardened
+    # mount"). That fallback had never run anywhere: Windows does not take it, and Linux
+    # and the Raspberry Pi both have /proc. It carries the image check that decides whether
+    # a kill may happen at all, so leaving it unexercised was the gap worth closing.
+    # The matrix is deliberately uneven, because the runners are not priced evenly.
+    # Linux is 1x, Windows 2x, macOS 10x, so a full three-by-three grid spends more than
+    # half its budget on the platform that is cheapest to reason about and least likely
+    # to break. Coverage is kept where it earns its keep:
+    #
+    #   Linux, every version   - the cheap axis, so it carries the Node-version sweep.
+    #   Windows, oldest+newest - the platform the fork exists for, at both ends of the
+    #                            supported range; the middle version has never once failed
+    #                            alone.
+    #   macOS, newest only     - one cell is enough to keep the `ps` fallback exercised,
+    #                            which is the whole reason macOS is here.
+    #
+    # If a version-specific macOS bug ever appears, widen it then, on evidence.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, node: '18.18' }
+          - { os: ubuntu-latest, node: '20' }
+          - { os: ubuntu-latest, node: '22' }
+          - { os: windows-latest, node: '18.18' }
+          - { os: windows-latest, node: '22' }
+          - { os: macos-latest, node: '22' }
+
+    steps:
+      # Pinned by commit rather than by tag. A tag is mutable: whoever can move `v4` can
+      # change what runs here, and this workflow runs on every push to a public repository.
+      # Resolved 2026-08-01 from the tag of the same name; bump deliberately, not silently.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # The suite runs against a fake grok CLI fixture, so no credentials and no
+      # real Grok CLI are needed.
+      - run: npm test
+
+      - name: Plugin version matches package version
+        run: npm run check-version

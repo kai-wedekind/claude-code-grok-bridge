@@ -1,0 +1,10 @@
+{
+  "name": "grok-build",
+  "version": "0.3.0",
+  "description": "Claude Code ↔ Grok Build bridge for review, critique, and delegation.",
+  "author": {
+    "name": "Kai Wedekind"
+  },
+  "homepage": "https://github.com/kai-wedekind/claude-code-grok-bridge",
+  "repository": "https://github.com/kai-wedekind/claude-code-grok-bridge"
+}

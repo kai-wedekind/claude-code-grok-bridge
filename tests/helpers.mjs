@@ -1,0 +1,36 @@
+// Modified from xai-org/grok-build-plugin-cc@5a9f924 by Kai Wedekind, 2026.
+// Apache-2.0 section 4(b) notice; see NOTICE and CHANGELOG.md for what changed.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { spawnSync } from "node:child_process";
+
+export function makeTempDir(prefix = "grok-build-plugin-test-") {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+export function writeExecutable(filePath, source) {
+  fs.writeFileSync(filePath, source, { encoding: "utf8", mode: 0o755 });
+}
+
+export function run(command, args, options = {}) {
+  return spawnSync(command, args, {
+    cwd: options.cwd,
+    env: options.env,
+    encoding: "utf8",
+    input: options.input,
+    timeout: options.timeout,
+    killSignal: options.killSignal,
+    shell: process.platform === "win32" && !path.isAbsolute(command),
+    windowsHide: true
+  });
+}
+
+export function initGitRepo(cwd) {
+  run("git", ["init", "-b", "main"], { cwd });
+  run("git", ["config", "user.name", "Grok Build Plugin Tests"], { cwd });
+  run("git", ["config", "user.email", "tests@example.com"], { cwd });
+  run("git", ["config", "commit.gpgsign", "false"], { cwd });
+  run("git", ["config", "tag.gpgsign", "false"], { cwd });
+}
