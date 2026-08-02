@@ -73,16 +73,29 @@ binary:
 | Coding data sharing | `grok`, then `/privacy` |
 | Telemetry | `GROK_TELEMETRY_ENABLED=0`, or `[features] telemetry` in `config.toml` |
 | Per-turn trace upload | `GROK_TELEMETRY_TRACE_UPLOAD=0`, or `[telemetry] trace_upload` |
+| Product analytics (Mixpanel) | `GROK_TELEMETRY_MIXPANEL_ENABLED=0` |
 | Feedback collection | `GROK_FEEDBACK_ENABLED=0` |
-| Error reporting | `DISABLE_ERROR_REPORTING=1` |
 
-Two honest limits on that table. First, these are the CLI's own knobs and the CLI is xAI's
-software: what each one covers, whether any of it is additionally gated server-side, and how
-long anything is retained are theirs to define and change — check their current terms rather
-than trusting a list written here. Second, the bridge forwards `GROK_*` and `XAI_*` to the
-child (see above), so setting these in the environment does reach the CLI when the bridge
-launches it — but a setting you make only in your shell will not follow a run started from
-somewhere else. Put them where they will be there every time.
+Every name above appears in the CLI's own environment-variable reference, which is embedded
+in the binary. That matters because of what is *not* in the table, below.
+
+Three honest limits. First, these are the CLI's own knobs and the CLI is xAI's software: what
+each one covers, whether any of it is additionally gated server-side, and how long anything is
+retained are theirs to define and change — check their current terms rather than trusting a
+list written here. Second, the bridge forwards `GROK_*` and `XAI_*` to the child (see above),
+so setting these in the environment does reach the CLI when the bridge launches it — but a
+setting you make only in your shell will not follow a run started from somewhere else. Put
+them where they will be there every time.
+
+Third, and the reason this section is shorter than it was: **there is a widely-repeated
+`DISABLE_ERROR_REPORTING=1` switch, and this table used to list it. Setting it for a
+bridge-launched run does nothing.** The name matches neither the `GROK_`/`XAI_` prefixes nor
+the exact allowlist, so the env filter strips it before the CLI is spawned — a control that
+looks applied and is not, which is worse than a gap. It is also absent from the CLI's own
+documented variable list; the string exists in the binary next to a `GROK_ERROR_REPORTING`
+spelling that *would* survive the filter, but neither is documented and we have not verified
+what either one does, so we are not going to tell you to set them. If you want that channel
+off, take it up with the CLI directly rather than through this bridge.
 
 Credit where it is due: this exposure was pointed out to us by
 [tylersue/claude-grok-delegation](https://github.com/tylersue/claude-grok-delegation), which
@@ -140,17 +153,61 @@ this at code you did not write:
 There is no sanitisation of repository content, and none is claimed. Treat the read-only
 barrier as the boundary.
 
+## Fetched content is not trusted input either
+
+The section above is about the repository, because that is the case this fork was built
+around. It is not the only content that reaches the model, and the same non-claim covers the
+rest of it.
+
+Read-only removes four tools — the shell, the file editor, and the two MCP meta-tools — and
+denies `Bash`, `Write`, `Edit` and `MCPTool`. Several of those *can* reach the network, and
+removing them closes those paths along with the write paths. What it does not close is the one
+deliberately left open. **So read-only is a write barrier that shuts most outbound doors as a
+side effect — not a network barrier that shuts them all**, and the door left open is the whole
+of your exposure here.
+
+`web_search` is deliberately kept, and that is a decision rather than an oversight: this fork
+carries research offloads as well as code review, and looking things up is frequently the
+task. The reasoning sits beside the list where it is defined, and a test pins it so it cannot
+be dropped by accident.
+
+So, on the same terms as the repository:
+
+- **What the agent fetches is untrusted input.** A search result can carry text addressed to
+  the model as easily as a README can. Nothing delimits it, tags it, or marks it as
+  untrusted — and this bridge could not do so if it wanted to, because it never sees it. Tool
+  results live inside the CLI process; the bridge composes a prompt and reads back a final
+  answer.
+- **`--cwd` does not reach this.** It scopes the working directory, which bounds what can be
+  read from disk and therefore what could be restated. It places no constraint on the network
+  path. The advice in the previous section is about the filesystem; do not read it as covering
+  this one.
+- **The sandbox does not close it either, on any platform.** The Grok CLI documents that web
+  search, web fetch and the LLM API always have network access, because the agent needs the
+  network to function.
+
+If you want a run that cannot search, the CLI has `--disable-web-search`. This bridge does not
+pass it today.
+
+Verified for `run`. `review` and `critique` additionally pass `--agent explore`, whose
+effective toolset is not something we have pinned down; it may be narrower. Treat the above as
+the conservative case rather than assuming the narrower one.
+
 ## The read-only barrier
 
 `run` is read-only unless `--write` is passed. The barrier is enforced by removing
 the writing tools from the agent (`--disallowed-tools`) and adding deny rules for
 `Bash`, `Write`, `Edit` and `MCPTool`.
 
-`--sandbox read-only` is passed as well, but **it is not the barrier**: the Grok
-CLI only enforces it through Landlock or Seatbelt, so on Windows it does nothing
-and prints that it continues without enforcement. A "read-only" run under sandbox
-alone could create files there — this was reproduced, and is why the barrier sits
-at the tool layer.
+`--sandbox read-only` is passed as well, but **it is not the barrier this fork relies on**:
+xAI documents enforcement through Landlock (Linux) and Seatbelt (macOS) and names no Windows
+mechanism, so on Windows it is not enforced and the CLI prints that it continues without it.
+We do not rely on it anywhere. Note the narrower claim — "not enforced" rather than "does
+nothing": xAI documents effects that follow from merely *requesting* a profile, so calling the
+flag inert would be an overstatement, and in a security document an overstatement in the
+comfortable direction is the wrong one to make. The barrier sits at the tool layer because
+that is the layer that holds on every platform, not because the sandbox was measured failing
+on this one.
 
 The barrier is applied on every launch path: foreground, background worker, the
 automatic retry, and review/critique. Delegating to a sub-agent does not escape it;

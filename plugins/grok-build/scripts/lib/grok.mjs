@@ -823,6 +823,42 @@ export async function runHeadlessAgent(cwd, options = {}) {
       const fatalEnvelope = findFatalErrorEnvelope(stdout);
       const cliFailed = status !== 0 || fatalEnvelope != null;
       const cliError = cliFailed ? parseCliErrorPayload(stdout) : null;
+      // ⚠ SAY WHAT HAPPENED, IN THE PLACE A PERSON READS.
+      //
+      // The progress line above fires at close, before anything is classified, so it can
+      // only say "Grok exited with status 1". The classification that follows lands in
+      // `failureKind` -> `failureCode`, which is a machine field: `runs`, `show` and the
+      // rendered output all surface `lastMessage`, and none of them surface a code.
+      //
+      // Measured 2026-08-02 on a real exhausted allowance: `lastMessage` said "Grok exited
+      // with status 1", and `rendered` was the raw CLI envelope opening with the words
+      // "Internal error". Every true word — 402, balance exhausted — sat inside that blob,
+      // behind a phrase that reads as a bug in this plugin. The reporter said they would
+      // have started debugging the bridge had they not known better. That is the exact
+      // failure this fork exists to prevent, and the README promises the opposite: a
+      // failure names which kind of failure it was.
+      //
+      // So emit a second progress line once the cause is known. It is not a retry and not
+      // a new state; it replaces a sentence that was true but useless with one that tells
+      // the reader what to do next.
+      if (cliError?.quotaExhausted) {
+        emitProgress(
+          options.onProgress,
+          "Grok refused the run: the account's usage balance is exhausted (HTTP 402). " +
+            "Retrying cannot help until the allowance resets or credit is added. " +
+            "The tokens this attempt already spent are recorded on the run.",
+          "failed",
+          { threadId: sessionId, agentPid }
+        );
+      } else if (cliFailed && looksLikeAuthFailure(stdout)) {
+        emitProgress(
+          options.onProgress,
+          "Grok refused the run: nobody is signed in. Sign in with `grok login " +
+            "--device-code` or set XAI_API_KEY. Retrying cannot help until then.",
+          "failed",
+          { threadId: sessionId, agentPid }
+        );
+      }
       const {
         envelope,
         parsed: envelopeParsed,
@@ -869,7 +905,7 @@ export async function runHeadlessAgent(cwd, options = {}) {
         structuredOutput,
         cliSessionId:
           isEnvelope && typeof envelope?.sessionId === "string" ? envelope.sessionId : null,
-        numTurns: isEnvelope ? (envelope?.num_turns ?? null) : null,
+        numTurns: isEnvelope ? (envelope?.num_turns ?? null) : (cliError?.numTurns ?? null),
         stopReason: isEnvelope ? (envelope?.stopReason ?? null) : null,
         usage: isEnvelope ? (envelope?.usage ?? null) : (cliError?.usage ?? null),
         // Set when the run failed for a reason worth naming; the bridge maps it to a
@@ -1094,7 +1130,25 @@ export function parseCliErrorPayload(rawOutput) {
           total_tokens: usage.totalTokens ?? 0
         }
       : null,
-    costTicks: Number.isInteger(usage?.costUsdTicks) ? usage.costUsdTicks : null
+    costTicks: Number.isInteger(usage?.costUsdTicks) ? usage.costUsdTicks : null,
+    // The CLI reports the turn count inside the error payload too, and dropping it here
+    // was losing it exactly where it is hardest to get again. Measured 2026-08-02 on a
+    // real 402: `promptUsage.numTurns` and `num_turns` both said 1, and the job record
+    // still showed `numTurns: null`, because the envelope path is the only one that read
+    // it and a fatal error produces no envelope. Turn count is the live diagnostic for
+    // whether a run did any work before it stopped; a failure path is the worst place to
+    // have it missing.
+    // Both spellings on the outer object, because the chain reached only one of them: the
+    // captured fixtures happen to carry `promptUsage.numTurns`, so a payload that put a
+    // camelCase `numTurns` on the detail and no usage block would have stored null while
+    // the count sat right there. Cheap to accept, and nothing else distinguishes them.
+    numTurns: Number.isFinite(Number(usage?.numTurns))
+      ? Number(usage.numTurns)
+      : Number.isFinite(Number(detail?.num_turns))
+        ? Number(detail.num_turns)
+        : Number.isFinite(Number(detail?.numTurns))
+          ? Number(detail.numTurns)
+          : null
   };
 }
 

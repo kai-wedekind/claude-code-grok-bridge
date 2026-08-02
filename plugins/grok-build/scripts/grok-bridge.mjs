@@ -76,6 +76,7 @@ import {
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import { collectUsage, renderUsage } from "./lib/usage-ledger.mjs";
 import {
+  failureHeadline,
   renderCancelReport,
   renderJobStatusReport,
   renderNativeReviewResult,
@@ -703,8 +704,13 @@ async function executeReviewRun(request) {
         failureCode,
         failureMessage
       }),
+      // A parsed critique summarises itself; a failed one gets the shared headline, like the
+      // task and native-review paths. Without it an auth failure listed itself as "Grok
+      // exited with status 1", because `failureDetail` is null there and `failureMessage`
+      // falls through to the exit status.
       summary:
         parsed.parsed?.summary ??
+        (failureCode ? failureHeadline(failureCode) : null) ??
         (failureMessage ||
           parsed.parseError ||
           firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`)),
@@ -786,10 +792,12 @@ async function executeReviewRun(request) {
     turnId: null,
     payload,
     rendered,
-    summary: firstMeaningfulLine(
-      result.finalMessage,
-      failureMessage || `${reviewName} completed.`
-    ),
+    // Same rule as the task path: on a failure `finalMessage` is the CLI's error envelope,
+    // so summarising a native review with its first line printed `{"type":"error"...` into
+    // the runs list. A classified failure names itself; everything else is unchanged.
+    summary:
+      (failureCode ? failureHeadline(failureCode) : null) ??
+      firstMeaningfulLine(result.finalMessage, failureMessage || `${reviewName} completed.`),
     jobTitle: `Grok Build ${reviewName}`,
     jobClass: "review",
     targetLabel: target.label
@@ -817,7 +825,9 @@ const READ_ONLY_DENY_RULES = ["Bash", "Write", "Edit", "MCPTool"];
  * What actually confined this run — and, more to the point, what only looked like it did.
  *
  * `--sandbox read-only` is passed on every read-only run and is enforced by the kernel on
- * Linux and macOS. On Windows it is accepted and does nothing. That was written down in
+ * Linux and macOS. On Windows it is accepted and not enforced — "not enforced" rather than
+ * "does nothing", because xAI documents effects that follow from merely requesting a
+ * profile, and the public docs were corrected to say so. That was written down in
  * the comments and in the README and nowhere the caller of a single run could see it: the
  * flag appeared on the command line, the run succeeded, and the payload said nothing about
  * a layer that had silently not applied.
@@ -1165,8 +1175,16 @@ async function executeTaskRun(request) {
       warnings.push(threadRegistrationError);
     }
     const failureMessage = failureParts.join(" ");
+    // One expression for "this run hard-failed", read by both the rendered text and the
+    // summary. Two surfaces deciding that separately is precisely how they came to
+    // disagree: the exit code said 2 and the rendered body carried no failure line.
+    // The RETRY_CANNOT_HELP term is what covers the exit-0 envelope path, where the CLI
+    // refuses the run and still exits 0 — exitStatus is already forced to 2 above, so
+    // this only ever aligns the text with a verdict that was reached anyway.
+    const runFailed =
+      !delivered || result.status !== 0 || RETRY_CANNOT_HELP.has(failureCode);
     // Only surface failureMessage on render when the run actually failed.
-    const renderFailureMessage = !delivered || result.status !== 0 ? failureMessage : "";
+    const renderFailureMessage = runFailed ? failureMessage : "";
     const rendered = renderTaskResult(
       {
         rawOutput,
@@ -1181,6 +1199,10 @@ async function executeTaskRun(request) {
         title: taskMetadata.title,
         jobId: request.jobId ?? null,
         write,
+        // Lets the renderer lead with the cause instead of the CLI's raw envelope. It is
+        // the same code the JSON payload carries, so the text and the machine field can
+        // no longer name different failures.
+        failureCode,
         usage: result.usage ?? null,
       costUsd: typeof result.costUsd === "number" ? result.costUsd : null,
       costTicks: Number.isInteger(result.costTicks) ? result.costTicks : null,
@@ -1216,7 +1238,14 @@ async function executeTaskRun(request) {
       turnId: null,
       payload,
       rendered,
-      summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+      // `runs` and `show` print `summary` for a finished job. Taking it from rawOutput
+      // meant a failed run summarised itself with the first line of an error envelope —
+      // `{"type":"error"...`. The headline is the same sentence the rendered text now
+      // opens with; falling back to failureMessage keeps an unknown code honest.
+      summary: runFailed
+        ? (failureHeadline(failureCode) ??
+          firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`))
+        : firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
       jobTitle: taskMetadata.title,
       jobClass: "task",
       write

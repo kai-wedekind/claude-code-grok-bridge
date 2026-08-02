@@ -83,10 +83,11 @@ Three things that are cheap to read now and expensive to learn later:
   `grok-bridge.mjs usage`. Read the
   *allowance period* line, not the rolling window.
 - **Read-only is the actual barrier** — enforced by removing the writing tools and adding
-  deny rules, not by `--sandbox`, which does nothing on Windows. See `SECURITY.md`.
-- **Repository content is untrusted input.** It goes into the prompt, and a model does not
-  reliably distinguish "text to review" from "instruction to follow". Never `--write` on a
-  repository you did not write.
+  deny rules, not by `--sandbox`, which is not enforced on Windows. It is a write barrier
+  and not a network one: web search stays available by design. See `SECURITY.md`.
+- **Repository content is untrusted input**, and so is anything the run fetches. Both go
+  into the prompt, and a model does not reliably distinguish "text to review" from
+  "instruction to follow". Never `--write` on a repository you did not write.
 
 ## Two operational surprises worth knowing up front
 

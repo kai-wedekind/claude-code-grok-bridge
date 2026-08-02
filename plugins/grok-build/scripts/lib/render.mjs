@@ -286,11 +286,18 @@ export function renderSetupReport(report) {
 
 // The result is cleared for every hard failure, not only for a bad JSON reply. Naming
 // the wrong cause sends the reader off to debug the model instead of the timeout.
-const REVIEW_FAILURE_HEADLINES = {
+//
+// Shared by every surface that has to state a cause in a sentence — review, critique and
+// the plain `run` path. It was review-only until 2026-08-02, which is why `run` still
+// opened with the CLI's raw error envelope while a critique of the same failure named it
+// properly. One table, so the three cannot drift into describing the same failure
+// differently.
+const FAILURE_HEADLINES = {
   timeout: "The run exceeded its time limit before a result was produced.",
   "cli-error": "The Grok CLI failed before a result was produced.",
   "output-truncated": "The output exceeded the capture limit and was cut off, so the result is incomplete.",
   "no-deliverable": "Grok returned no output.",
+  "schema-parse": "Grok did not return valid structured JSON.",
   "quota-exhausted":
     "Grok refused the run for quota reasons (HTTP 402), so it stopped before producing a result. " +
     "Whether retrying helps depends on the account: an allowance that has to reset, or credit that can be topped up.",
@@ -303,10 +310,27 @@ const REVIEW_FAILURE_HEADLINES = {
     "Nobody is signed in, so the run stopped before producing a result. Sign in with `grok login --device-code` or set XAI_API_KEY."
 };
 
+/**
+ * A plain sentence for a failure code, or null when the code is unknown.
+ *
+ * Null rather than a generic phrase on purpose: a caller that gets null keeps whatever it
+ * said before, which is worse-worded but never wrong. Inventing a headline for a code this
+ * table has not seen is how a reader gets told a confident falsehood about why a run died.
+ *
+ * @param {string|null|undefined} failureCode
+ * @returns {string|null}
+ */
+export function failureHeadline(failureCode) {
+  if (typeof failureCode !== "string" || failureCode.length === 0) {
+    return null;
+  }
+  return FAILURE_HEADLINES[failureCode] ?? null;
+}
+
 export function renderReviewResult(parsedResult, meta) {
   if (!parsedResult.parsed) {
     const headline =
-      REVIEW_FAILURE_HEADLINES[meta?.failureCode] ?? "Grok did not return valid structured JSON.";
+      failureHeadline(meta?.failureCode) ?? "Grok did not return valid structured JSON.";
     const lines = [
       `# Grok Build ${meta.reviewLabel}`,
       "",
@@ -398,7 +422,16 @@ export function renderNativeReviewResult(result, meta) {
   ];
 
   if (failed) {
-    lines.push(failure || "Grok review failed.");
+    // The caller has always passed `failureCode` here and this renderer never read it, so a
+    // failed review led with `failureMessage` — which falls back to "Grok exited with status
+    // N" whenever the CLI wrote nothing to stderr. For an expired session that put the exit
+    // code on the first line and the remedy ("grok login --device-code") down inside
+    // "Partial output". Same rule as the task path: name the cause, keep the evidence.
+    const headline = failureHeadline(result.failureCode);
+    lines.push(headline || failure || "Grok review failed.");
+    if (headline && failure && failure !== headline) {
+      lines.push("", `Details: ${failure}`);
+    }
     if (stdout) {
       lines.push("", "Partial output:", "", "```text", stdout, "```");
     }
@@ -431,13 +464,32 @@ export function renderTaskResult(parsedResult, meta) {
   const warningLine = warnings.length > 0 ? `[grok-cc] Warning: ${warnings.join(" ")}\n` : "";
   const usageLine = formatUsageFooter(parsedResult?.usage ?? meta?.usage);
   const usageSuffix = usageLine ? `\n${usageLine}\n` : "";
+  // ⚠ THE CAUSE GOES ON LINE ONE.
+  //
+  // Until 2026-08-02 a failed run opened with the CLI's raw output and stated the reason
+  // underneath it. For an exhausted allowance that raw output is an error envelope whose
+  // first words are "Internal error", so a billing refusal presented as a crash in this
+  // plugin — one reporter said they would have started debugging the bridge. The reason
+  // was in the text, several hundred characters down, which is not where anyone looks.
+  //
+  // The envelope is demoted, never dropped: on `output-truncated` it holds the partial
+  // answer, and on `cli-error` it is the only description of what went wrong. Only when
+  // the code is unknown does this fall back to the old shape — see failureHeadline.
+  const headline = failure ? failureHeadline(meta?.failureCode) : null;
+  // A detail earns its line only by adding something. For `no-deliverable` and
+  // `schema-parse` the CLI's own message IS the table sentence, so appending it printed the
+  // same words twice — the cause right, the evidence a copy of it. The other call sites
+  // already guarded on this; these two did not.
+  const detail = headline && failure && failure !== headline ? failure : "";
 
   if (rawOutput) {
     const body = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
     // A failed run must say so on stdout too: hiding the reason behind partial output
     // left callers unable to tell a non-zero exit from a successful one.
     if (failure) {
-      return `${body}\n[grok-cc] Run did not succeed: ${failure}${usageSuffix || "\n"}`;
+      return headline
+        ? `[grok-cc] Run did not succeed: ${headline}\n\n${body}${detail ? `\n[grok-cc] Details: ${detail}` : ""}${usageSuffix || "\n"}`
+        : `${body}\n[grok-cc] Run did not succeed: ${failure}${usageSuffix || "\n"}`;
     }
     if (warningLine) {
       return `${body}\n${warningLine}${usageSuffix}`;
@@ -446,7 +498,9 @@ export function renderTaskResult(parsedResult, meta) {
   }
 
   if (failure) {
-    return `${failure}${usageSuffix || "\n"}`;
+    return headline
+      ? `[grok-cc] Run did not succeed: ${headline}${detail ? `\n\n[grok-cc] Details: ${detail}` : ""}${usageSuffix || "\n"}`
+      : `${failure}${usageSuffix || "\n"}`;
   }
   if (warningLine) {
     return `${warningLine}${usageSuffix}`;
@@ -580,12 +634,28 @@ export function renderStoredJobResult(job, storedJob) {
       (typeof storedJob?.errorMessage === "string" && storedJob.errorMessage.trim()) ||
       (typeof storedJob?.result?.failureMessage === "string" && storedJob.result.failureMessage.trim()) ||
       "";
-    if (errorMessage) {
+    // `show` re-assembles from the stored record rather than replaying `rendered`, so it
+    // needed the headline of its own: `errorMessage` is `failureMessage`, which for auth and
+    // a bare cli-error is still "Grok exited with status N". The raw envelope below is left
+    // where it is — clearly labelled "Partial output" and now preceded by the cause, which
+    // is the property that matters. Nesting the whole rendered block under that label would
+    // read worse than this.
+    const headline = failureHeadline(failureCode);
+    if (headline) {
+      lines.push("", headline);
+      if (errorMessage && errorMessage !== headline) {
+        lines.push("", `Details: ${errorMessage}`);
+      }
+    } else if (errorMessage) {
       lines.push("", errorMessage);
     } else {
       lines.push("", "Run did not succeed.");
     }
-    const partial = (rawOutput || renderedText).trimEnd();
+    // Fall back to the stored `rendered` only when no headline was printed. With one, that
+    // block opens with the very same sentence, so nesting it under "Partial output" stated
+    // the cause a second time — and for a failure with no envelope there is nothing else
+    // in it to show.
+    const partial = (rawOutput || (headline ? "" : renderedText)).trimEnd();
     if (partial) {
       lines.push("", "Partial output:", partial);
     }

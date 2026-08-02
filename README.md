@@ -35,9 +35,11 @@ a failure.
 - **A result, or a reason there is none.** Success means output arrived, failure names
   which kind of failure it was, and partial output is kept and labelled as partial. The
   exit code, the printed text and the JSON payload are not allowed to disagree.
-- **Safe to point at code you did not write.** Read-only is the default and is real:
-  the writing tools are removed, which holds on Windows too, where the CLI's own sandbox
-  flag is silently ignored. Full write access is one flag away when you want it.
+- **Read-only by default, and the default is real.** The writing tools are removed rather
+  than discouraged, which holds on Windows too, where the CLI's own sandbox flag is not
+  enforced. It is a write barrier, not a network barrier — web search stays available, and
+  `SECURITY.md` says what that does and does not protect. Full write access is one flag away
+  when you want it.
 - **Built for repeat use, not one-shot demos.** Conversations continue across separate
   calls instead of restarting cold; structured output comes back as parsed JSON and
   fails loudly rather than handing you prose that will not parse; and you can fire as
@@ -246,9 +248,11 @@ hardware. So the code is exercised and the product is not proven — expect it t
 expect it to be verified, and a bug report from a Mac is genuinely useful.
 
 **What happens when the Grok allowance runs out mid-run?**
-The run fails with `failureCode: quota-exhausted` rather than looking like a generic error,
-and the tokens the run had already spent before the refusal are still booked to the ledger.
-Retrying cannot help until the allowance resets.
+The run fails with `failureCode: quota-exhausted`, and the surfaces you actually read say so
+in words: the output opens by naming the refusal, and `runs` and `show` summarise it the same
+way, instead of leading with the CLI's error envelope. The tokens the run had already spent
+before the refusal are still booked to the ledger — a refused run is not a free one. Whether
+retrying helps depends on the account: an allowance has to reset, credit can be topped up.
 
 **Why is the history a single commit?**
 The fork's development history was condensed for publication. The upstream baseline is named
@@ -720,6 +724,7 @@ the modification notice and the trademarks.
 | | |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | What differs from the upstream baseline, and why |
+| [ROADMAP.md](ROADMAP.md) | What is likely to grow next, and what deliberately is not |
 | [SECURITY.md](SECURITY.md) | What each mode protects, what it does not, and how to report a vulnerability |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to propose a change and what the suite expects |
 | [docs/ADOPTION.md](docs/ADOPTION.md) | Getting Claude Code to actually reach for it |
