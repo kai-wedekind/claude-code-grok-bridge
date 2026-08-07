@@ -100,7 +100,7 @@ Identity metadata in this tree names Kai Wedekind as owner/author; the plugin fu
 - **Something for the CLI to bill against.** The bridge does not handle billing or authentication at all — it launches the CLI and reports what the CLI reports. So whatever makes `grok` work for you interactively will work here: a signed-in session, or `XAI_API_KEY` in the environment. Which plans and credit arrangements exist, and how they interact, is xAI's to define and change; check their current terms rather than trusting a list written here. What is worth knowing on this side is that **every run costs something**, that the bridge cannot see your remaining balance, and that the local ledger is therefore the only spend record you get.
 - A logged-in Grok CLI session — verify with `grok models`, and read what it prints rather than trusting its exit code. On the first call after the access token expires, that command can exit `0` while stating that you are *not* authenticated: it reads its auth state before the in-flight token refresh completes. Measured twice on 2026-07-31 against grok 0.2.117: the refresh took 373 ms and 441 ms, and about 690 ms passed before the model catalog was usable. `/grok-build:check` accounts for this and will not report `ready` in that state.
 - There are **no npm dependencies**. Nothing is installed from a registry, and there is no lockfile — `git clone` plus Node is the whole supply chain.
-- **Platform coverage is uneven, and the two halves are worth separating.** *Unit tests:* 316 of them, run in CI on all three operating systems — Linux across Node 18.18, 20 and 22, Windows on the oldest and newest of those, macOS on the newest. A good part of that suite spawns and kills real processes rather than mocking them, so the platform-specific process handling genuinely runs on each. *End to end against the real `grok` CLI:* an eleven-gate acceptance suite covering the write barrier, structured output, thread continuity, concurrency, crash recovery and orphan cleanup — run on Windows, on Linux and on a Raspberry Pi (aarch64), and **never on macOS**, for want of the hardware. So macOS has the code exercised but not the product; expect it to work, do not expect it to be proven.
+- **Platform coverage is uneven, and the two halves are worth separating.** *Unit tests:* the full suite runs in CI on all three operating systems — Linux across Node 18.18, 20 and 22, Windows on the oldest and newest of those, macOS on the newest. A good part of that suite spawns and kills real processes rather than mocking them, so the platform-specific process handling genuinely runs on each. *End to end against the real `grok` CLI:* an eleven-gate acceptance suite covering the write barrier, structured output, thread continuity, concurrency, crash recovery and orphan cleanup — run on Windows, on Linux and on a Raspberry Pi (aarch64), and **never on macOS**, for want of the hardware. So macOS has the code exercised but not the product; expect it to work, do not expect it to be proven.
 
 ## Install
 
@@ -152,6 +152,26 @@ claude plugin install grok-build@claude-code-grok-bridge
 Or, when Claude Code is already open, use `/plugin`, add the local marketplace path, then install `grok-build@claude-code-grok-bridge`.
 
 > **The marketplace id is deliberately not upstream's.** It matches this repository rather than reusing `xai-grok-build`, so the official xAI plugin and this fork can be installed side by side. That matters more than it sounds: measured on a clean machine, 2026-07-31, Claude Code 2.1.196 accepted a second marketplace under an id it already knew **without any warning** and exited 0, after which the installed plugin failed to load and pointed at whichever path was registered last — and removing the duplicate marketplace uninstalled the plugin along with it.
+
+### Staying up to date
+
+*(Taking a newer **release**. For mirroring your own edits into the installed copy, see [Updating an existing install](#updating-an-existing-install) below — different job, `deploy-local.sh`.)*
+
+**Nothing here notifies you that a new version exists**, and the install above adds a step people miss: **the marketplace is your clone**, so refreshing it re-reads a directory rather than fetching anything. Updating therefore starts with git:
+
+```bash
+git -C /path/to/claude-code-grok-bridge pull
+claude plugin marketplace update claude-code-grok-bridge
+claude plugin update grok-build@claude-code-grok-bridge
+```
+
+⚠ **Skip the first line and the other two still succeed — and leave you on the old build.** That is the whole trap: the commands report success because the marketplace faithfully re-read a clone nobody had updated.
+
+Then reload. Restarting Claude Code is the dependable way; `/reload-plugins` also exists. Confirm what you are actually running with `claude plugin list`, and read [CHANGELOG.md](CHANGELOG.md) or the [releases](https://github.com/kai-wedekind/claude-code-grok-bridge/releases) for what changed.
+
+> Claude Code does have an auto-update path for marketplaces, but it is off by default for local and third-party sources — which is what the install above creates. So assume updating is yours to do.
+>
+> **0.3.2 is worth taking promptly.** It repairs a defect that degraded the host's shell rather than this plugin, so an affected user would have had no reason to suspect the bridge at all.
 
 ### 3. Verify the install
 
@@ -637,6 +657,7 @@ Prefer bridge `--background` so stop can kill both the Node worker and the grok 
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
+| A `/grok-build:*` command fails with a **shell parse error**, or returns **exit 0 with no output at all** | Almost certainly the Claude Code **Bash tool**, not this plugin. Every command here runs through it, so its failures surface from inside our commands and read as ours. On Windows, an oversized `bash -c` argument is truncated silently: the cut can land mid-quote (parse error) or on a line boundary (**exit 0, empty output, your command never ran**) | Update to **0.3.2 or later** — versions before it grew `CLAUDE_ENV_FILE` on every SessionStart until it crossed the limit. If it persists on 0.3.2+, test with a bare `echo ok` through the Bash tool: if that also fails, the cause is outside this plugin. |
 | Slot wait messages, then run starts | Concurrency cap full for the wait window | Expected; raise `GROK_CC_MAX_CONCURRENCY`, wait for other agents, or leave default (start-anyway after wait). |
 | `thread "…" is already in use` | Another run holds that named thread lock | Wait, use another `--thread` name, or stop the holder. |
 | Exit `2` + `failureCode: no-deliverable` | Empty model output after optional read-only nudge | Retry with clearer prompt; do not assume write side effects. |

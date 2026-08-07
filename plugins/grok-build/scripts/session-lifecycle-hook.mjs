@@ -44,17 +44,68 @@ function shellEscape(value) {
  * offer, so a value containing spaces cannot be expressed in it at all.
  * Assumption: values are single-line; newlines are collapsed to spaces.
  */
+/** Does this line define `name`, in either the shell or the plain form? */
+function isLineForVar(name, line) {
+  const trimmed = line.trim();
+  return trimmed.startsWith(`${name}=`) || trimmed.startsWith(`export ${name}=`);
+}
+
+/**
+ * ⚠ REWRITE THIS VARIABLE'S LINES, NEVER APPEND.
+ *
+ * SessionStart fires on every start, resume and compaction, and Claude Code inlines the
+ * WHOLE of CLAUDE_ENV_FILE into the `bash -c` argument it builds for every Bash tool call.
+ * Appending grew that file without bound — measured 2026-08-06, one session had reached 57
+ * copies of each variable, 15 KiB. MSYS2 bash silently truncates a `-c` argument longer than
+ * 8186 characters: no error, no warning, everything past the cut simply gone. So once the
+ * file crossed that line the user's command was severed and bash reported a parse error at
+ * whatever innocent line the cut happened to land in.
+ *
+ * Six sessions on one machine were dead before the cause was found, and three of them spent
+ * a day theorising, because the error names bash and not this plugin — which also means no
+ * user would ever have reported it to us. The plugin was degrading its host, invisibly and
+ * progressively, and only on long-lived sessions.
+ *
+ * Only lines for THIS variable are dropped, so a second hook sharing the file keeps its own.
+ * Rewriting also repairs a file that an older build already bloated, on the next SessionStart.
+ */
 function appendEnvVar(name, value) {
-  if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
+  const file = process.env.CLAUDE_ENV_FILE;
+  if (!file || value == null || value === "") {
     return;
   }
   const singleLine = String(value).replace(/\r?\n/g, " ");
   const quoted = shellEscape(singleLine);
-  fs.appendFileSync(
-    process.env.CLAUDE_ENV_FILE,
-    `export ${name}=${quoted}\n${name}=${singleLine}\n`,
-    "utf8"
-  );
+  const block = `export ${name}=${quoted}\n${name}=${singleLine}\n`;
+
+  let existing = "";
+  try {
+    existing = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    // ⚠ ONLY "not there yet" may be read as empty. Every other failure must abort, because
+    // what follows is a WHOLE-FILE WRITE: treating a transient EBUSY, EACCES or EMFILE as
+    // "the file was empty" would erase lines this same hook wrote milliseconds earlier.
+    // handleSessionStart performs three of these read-modify-write cycles back to back, so
+    // one failed read on the second or third would silently drop the variables from the
+    // first — and the session would then run without a state root or a session id.
+    //
+    // This exposure is NEW, introduced by rewriting instead of appending: append-only code
+    // had no path that could destroy anything, so the bare `catch` was harmless there and
+    // is not harmless here. Losing this SessionStart's variables is recoverable; corrupting
+    // the file is not.
+    if (error?.code !== "ENOENT") {
+      return;
+    }
+    existing = "";
+  }
+  // ⚠ The `line.trim() !== ""` clause is load-bearing, not tidying: splitting on the block's
+  // own trailing newline yields an empty final element, and without the filter the file grows
+  // by one byte per variable per SessionStart — the same unbounded growth, merely slower.
+  const kept = existing
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== "" && !isLineForVar(name, line));
+  const next = kept.length > 0 ? `${kept.join("\n")}\n${block}` : block;
+  fs.writeFileSync(file, next, "utf8");
 }
 
 /**

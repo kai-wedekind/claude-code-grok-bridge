@@ -537,3 +537,92 @@ test("SURFACE-06: SessionStart writes export and plain KEY=VALUE lines", () => {
   assert.match(body, /export GROK_CC_TRANSCRIPT_PATH=/);
   assert.match(body, /^GROK_CC_TRANSCRIPT_PATH=/m);
 });
+
+test("SURFACE-06: repeated SessionStart does not grow the env file", () => {
+  // ⚠ This is the defect that killed the Bash tool in six sessions on one machine.
+  //
+  // SessionStart fires on every start, resume and compaction, and the hook used to APPEND.
+  // Claude Code inlines the whole of CLAUDE_ENV_FILE into the `bash -c` argument of every
+  // Bash tool call, and MSYS2 bash silently truncates that argument past 8186 characters —
+  // no error, everything after the cut simply gone. So the file grew about 531 bytes per
+  // event until the user's command was severed and bash blamed a parse error on whatever
+  // line the cut landed in. Measured 2026-08-06: one session held 57 copies of each
+  // variable, 15 KiB, and had been unable to run a single Bash command for days.
+  //
+  // The error names bash, never this plugin, so no user would ever have reported it. That
+  // is why this asserts a BOUND rather than the presence of a line: presence was already
+  // green while the file was ten times too big.
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  fs.writeFileSync(envFile, "", "utf8");
+  const pluginData = makeTempDir();
+
+  function fire(sessionId) {
+    return run(process.execPath, [HOOK, "SessionStart"], {
+      env: { ...process.env, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: pluginData },
+      input: JSON.stringify({
+        hook_event_name: "SessionStart",
+        session_id: sessionId,
+        transcript_path: "C:\\\\tmp\\\\transcript.jsonl"
+      })
+    });
+  }
+
+  assert.equal(fire("sess-1").status, 0);
+  const afterFirst = fs.readFileSync(envFile, "utf8");
+
+  for (let i = 0; i < 8; i += 1) {
+    assert.equal(fire("sess-1").status, 0);
+  }
+  const afterMany = fs.readFileSync(envFile, "utf8");
+
+  assert.equal(
+    afterMany.length,
+    afterFirst.length,
+    `nine identical SessionStart events must not grow the file; grew ${afterFirst.length} -> ${afterMany.length}`
+  );
+  for (const name of ["GROK_CC_SESSION_ID", "GROK_CC_TRANSCRIPT_PATH", "CLAUDE_PLUGIN_DATA"]) {
+    const hits = afterMany.split("\n").filter((l) => l.trim().startsWith(`export ${name}=`));
+    assert.equal(hits.length, 1, `${name} must appear exactly once, found ${hits.length}`);
+  }
+
+  // A changed value replaces rather than accumulates, and stays a single pair.
+  assert.equal(fire("sess-2").status, 0);
+  const afterChange = fs.readFileSync(envFile, "utf8");
+  assert.match(afterChange, /GROK_CC_SESSION_ID=.?sess-2/);
+  assert.doesNotMatch(afterChange, /sess-1/, "the superseded value must be gone, not appended past");
+
+  // The whole point: it must stay far below the shell's argument limit.
+  assert.ok(
+    afterChange.length < 2000,
+    `env file must stay small; MSYS2 bash truncates a -c argument past 8186 chars. Got ${afterChange.length}`
+  );
+});
+
+test("SURFACE-06: an unreadable env file aborts instead of overwriting", () => {
+  // Rewriting instead of appending introduced a destructive path the old code could not
+  // reach: read fails -> `existing` is empty -> the whole file is overwritten with one
+  // variable. handleSessionStart runs three such cycles in a row, so a transient failure on
+  // the second would erase what the first had just written. Only ENOENT may be read as
+  // empty; anything else must leave the file alone.
+  //
+  // A directory in place of the file produces a non-ENOENT read error (EISDIR/EPERM) without
+  // needing permission games that behave differently on Windows and POSIX.
+  const dirAsFile = makeTempDir();
+  const result = run(process.execPath, [HOOK, "SessionStart"], {
+    env: {
+      ...process.env,
+      CLAUDE_ENV_FILE: dirAsFile,
+      CLAUDE_PLUGIN_DATA: makeTempDir()
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: "sess-unreadable",
+      transcript_path: "C:\\\\tmp\\\\transcript.jsonl"
+    })
+  });
+
+  // A SessionStart hook that throws is worse than one that writes nothing: it fires on every
+  // start, resume and compaction, so a crash here is a crash the user meets constantly.
+  assert.equal(result.status, 0, `hook must survive an unreadable env file: ${result.stderr}`);
+  assert.ok(fs.statSync(dirAsFile).isDirectory(), "the target must be left untouched");
+});

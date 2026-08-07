@@ -5,6 +5,59 @@ All notable changes to this fork are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-08-07
+
+One defect and the means of finding out about it. **Update if you are on any earlier
+version**, because the bug does not look like this plugin's fault.
+
+### Fixed
+
+- **The SessionStart hook could break your shell, and you would never have suspected
+  us.** It appended to `CLAUDE_ENV_FILE` on every SessionStart — and SessionStart fires
+  on every start, resume and compaction, not once per session. Claude Code inlines that
+  whole file into the `bash -c` argument of every Bash tool call, and a `bash -c`
+  argument past 8186 characters is truncated **silently** on Windows. So after roughly
+  fifteen session events the file crossed that limit and the command at the end of the
+  argument was severed: bash then reported a parse error on an innocent line, or — when
+  the cut landed on a line boundary — returned **exit 0 with empty output, having run
+  nothing at all**. That second form is the dangerous one: it is indistinguishable from
+  a genuine "no matches" or "tests pass".
+
+  The hook now rewrites its own lines instead of appending. It also repairs a file an
+  earlier version already bloated, on the next SessionStart, so no manual cleanup is
+  needed. Measured before the fix: six sessions on one machine dead, the worst holding
+  57 copies of each variable at 15 KiB.
+
+- An unreadable `CLAUDE_ENV_FILE` no longer crashes the hook or overwrites the file.
+  Only "does not exist" is treated as empty; any other read error aborts without
+  writing, because the write is a whole-file replacement and three run back to back.
+
+### Changed
+
+- **The README now says how to update, and admits that nothing tells you to.** An
+  installed plugin stays at the version it was installed at, and publishing a release
+  does not reach it; Claude Code's marketplace auto-update is off by default for the
+  local and third-party sources this plugin installs from. The instructions also start
+  with `git pull`, because the marketplace *is* your clone — refreshing it re-reads a
+  directory rather than fetching, so without that step both plugin commands succeed and
+  leave you on the old build. That gap is why this fix needed documenting as much as
+  writing.
+- Troubleshooting covers the symptom above, including the silent exit-0 form, so it is
+  attributed to the Bash tool rather than to a run that appeared to do nothing.
+- The README no longer states a unit-test count. It was wrong — 316 against an actual
+  333 — and a number that cannot go stale is better than one that is merely correct
+  today.
+
+### Verified
+
+- **Grok CLI 1.0.0.** The acceptance suite passes 11/11 on Windows and on a Raspberry
+  Pi (aarch64) against 1.0.0, covering the write barrier, write mode, structured
+  output, thread continuity, six-way concurrency and crash recovery — and an induced
+  timeout confirms the failure path still classifies and renders correctly.
+  ⚠ The `quota-exhausted` and `not-authenticated` envelope shapes are captured from
+  0.2.117 and could not be induced non-destructively; they are **unverified** against
+  1.0.0.
+
 ## [0.3.1] — 2026-08-02
 
 No new capability. Everything here answers review of the published 0.3.0 tree.
