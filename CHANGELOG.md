@@ -2,61 +2,139 @@
 
 All notable changes to this fork are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.2] — 2026-08-07
+**Every fix is marked with where the defect came from**, because "we fixed a bug" and "we fixed a bug you would otherwise still have" are different statements, and a reader deciding whether to use a fork deserves to know which one they are reading:
 
-One defect and the means of finding out about it. **Update if you are on any earlier
-version**, because the bug does not look like this plugin's fault.
+- **[upstream]** — the defect is in [xai-org/grok-build-plugin-cc](https://github.com/xai-org/grok-build-plugin-cc) and was inherited by this fork. Unless the note says it was reported and closed, assume the original still has it.
+- **[fork]** — this fork introduced it, in code upstream does not have. Ours to own.
+- **[new]** — a capability upstream does not have at all, so there is no defect to attribute.
+
+The line is drawn by reading the upstream tree at `92b76a6`, not by recollection.
+
+## [0.3.3] — 2026-08-09
+
+Read-only was removing four tools and now removes fourteen — `write` had been observed being called, and only the deny rules stopped it. On Windows the session hook could hand your shell a state path with the backslashes eaten, so every run's records and the spend ledger went to a mangled directory. And reclaiming an abandoned run could terminate a *different* agent that had since been given that process id. **Update from any earlier version.**
+
+Beyond those three: the plugin now tells you when a newer release exists, `check` says which build is actually running, and `show --strands` surfaces what Grok's subagents did.
+
+**How to take it:** `git pull` in your clone, then `claude plugin marketplace update`, then `claude plugin update`, then reload. ⚠ **Skip the `git pull` and the other two still report success while leaving you on the old build** — the marketplace re-reads your clone rather than fetching. The full sequence is under "Staying up to date" in the README.
+
+### Added
+
+- [new] **You can see what Grok's subagents actually did.** When Grok splits a task across subagents, the CLI writes each one's full output to its own file — and this bridge read none of it, keeping only the parent's final answer. Nothing was ever lost on disk; it simply never reached you. Measured across every session on one machine: **69 fan-out runs, 111 strands, 162,961 characters** sitting unread, the oldest from 26 July. `show <run-id> --strands` now reports them, per strand, with what each produced. ⚠ **The tally reaches further than that flag suggests**: `runs`, `runs <id>` and plain `show <id>` all print the subagent block — how many ran, how many delivered, how many produced nothing, and the per-strand lines. `--strands` gates only the full deliverable text, so you find out that a fan-out half-died without asking for it.
+
+  The synthesis was never built blind — that was checked separately. On a six-way run, every strand's deliverable reached the parent model at 100% line coverage, so Grok saw everything; only the reply to you dropped it.
+
+- [new] **And it tells you when a strand produced nothing.** Across those 111 strands, **44% failed** — `general-purpose` 39 failures against 11 completions, while `explore` never failed once. A run whose fan-out half-died still charged the allowance and still returned a confident answer. You now get how many ran, how many delivered, and how many produced nothing. The cause of that failure rate belongs to the CLI, is not known, and is not guessed at here.
+
+- [new] **The plugin tells you when a newer release exists — and this is the first version that contacts the network at all.** At session end it asks GitHub's public releases endpoint whether a newer tag exists, caches the answer, and prints one line at the next session start if you are behind.
+
+  What it does *not* do matters as much: it never downloads or installs anything; it asks at most once every six hours after a success and backs off from one hour to one day after a failure; and **when the check has failed or never run it says nothing, rather than telling you that you are up to date**. Opt out with `GROK_CC_UPDATE_CHECK=0`. This is the only outbound request the plugin makes on its own behalf, and `SECURITY.md` describes it in full. ⚠ **`check --fetch-update` asks immediately and deliberately overrides that opt-out** — the variable stops the plugin reaching the network on its own, and someone typing the flag is not the plugin acting on its own. If you set the variable to keep the machine off the network entirely, do not type that flag. ⚠ Being told is not being updated — an installed plugin does not update itself, and the marketplace re-reads your clone rather than fetching.
+
+- [new] **`check` now tells you which build is actually running**, and says so loudly when the install directory, the plugin manifest and Claude Code's registry disagree — which they silently can, because updating a plugin is several steps and skipping one still reports success. A version number you cannot trust is worse than none.
+
+- [new] **`check` also reports update state on every run, from the cache, without touching the network.** A `Version:` block now appears unconditionally with one of five answers: behind, and it prints the releases URL; current; current *downgraded to unknown* because the last successful check is too old to stand behind; ahead of the latest release; or unknown, which says "this is not an all-clear" and points at `check --fetch-update`. ⚠ **This is deliberately the opposite policy to the session-start notice**, which stays silent unless you are behind — a command you typed is asking a question and deserves an answer including "I don't know", while a line that appears by itself must not claim you are up to date on the strength of a check that never ran. The pre-existing `Status:` line is now explicitly scoped to node, grok and auth, because it never covered version state and read as though it did.
+
+- [new] **`check --verify-tools`** asks the installed CLI which tool ids it still recognises. An id the CLI does not know is accepted in silence and simply does nothing, so a removal list can rot into decoration across a CLI upgrade with no sign at all. ⚠ **It has to start a real Grok session to ask, so it spends real allowance** — which is why it is a flag you type rather than something `check` does on its own. Plain `check` still costs nothing.
+
+  ⚠ **And it is the one form of `check` that can exit non-zero**, which matters if you put it in a script: **1** when an id in the removal list matches nothing or the list breaks session start, **2** when the probe could not tell — auth failure, no debug log, or the two-minute timeout. Plain `check` still always exits 0. A command that prints "3 of 14 MATCH NOTHING" and then exits 0 is read as success by everything without eyes, which is the whole reason the flag reports this way.
+
+### Removed
+
+- [upstream] **`/grok-build:import` and the bridge's own `import` subcommand.** It shelled out to a Grok CLI subcommand that does not exist — checked against both 0.2.118 and 1.0.0 — so it never worked for anyone; what it did instead was fail in a way that looked like a defect in this bridge. There is no successor. If it appears in a script of yours, delete the line. `GROK_CC_TRANSCRIPT_PATH`, whose only consumer it was, goes with it.
 
 ### Fixed
 
-- **The SessionStart hook could break your shell, and you would never have suspected
-  us.** It appended to `CLAUDE_ENV_FILE` on every SessionStart — and SessionStart fires
-  on every start, resume and compaction, not once per session. Claude Code inlines that
-  whole file into the `bash -c` argument of every Bash tool call, and a `bash -c`
-  argument past 8186 characters is truncated **silently** on Windows. So after roughly
-  fifteen session events the file crossed that limit and the command at the end of the
-  argument was severed: bash then reported a parse error on an innocent line, or — when
-  the cut landed on a line boundary — returned **exit 0 with empty output, having run
-  nothing at all**. That second form is the dangerous one: it is indistinguishable from
-  a genuine "no matches" or "tests pass".
+- [upstream] **`--effort xhigh` was rejected, and it is the CLI's highest reasoning level.** xAI shipped it with grok-4.6; this plugin validated `--effort` against a fixed `low` / `medium` / `high` and refused anything else, so the best setting was unreachable through the bridge — and it failed as a *validation error*, which reads like a typo rather than a missing capability. Upstream still carries the same three-level set. Accepted here now: `low`, `medium`, `high`, `xhigh`.
 
-  The hook now rewrites its own lines instead of appending. It also repairs a file an
-  earlier version already bloated, on the next SessionStart, so no manual cleanup is
-  needed. Measured before the fix: six sessions on one machine dead, the worst holding
-  57 copies of each variable at 15 KiB.
+  ⚠ **Those four are measured against a running CLI, not read out of its binary — and the difference is not academic.** The binary contains `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, which looks exactly like the flag's set and is not it. `grok --help` documents no values for the flag at all. The only authoritative statement is the CLI's own rejection, which you can obtain solely by asking for a level that does not exist: `grok --effort __probe__ -p x` answers `unknown effort level '__probe__'; use one of: xhigh, high, medium, low`. Checked that way against grok 1.0.5 and grok 1.0.0, which answer identically. Two tests pin this — one that the list contains `xhigh`, one that it contains none of the three names the binary suggests and the flag refuses — so a future maintainer who "corrects" the list from the binary goes red rather than shipping it.
 
-- An unreadable `CLAUDE_ENV_FILE` no longer crashes the hook or overwrites the file.
-  Only "does not exist" is treated as empty; any other read error aborts without
-  writing, because the write is a whole-file replacement and three run back to back.
+  ⚠ **The staleness is real and is not solved.** If xAI adds a level, this list needs a human, and nothing here notices on its own — which is exactly how `xhigh` was missed for months. Removing the list entirely was tried and is worse: it makes a mistyped effort fail at CLI launch as `cli-error`, the same failure code that means the CLI died mid-task and calls for the opposite response. Fast local refusal beats automatic tracking of a set that has not moved between the two CLI versions testable here. Automating the probe is on the list for a later release.
 
-### Changed
+  A second gate covers what the first one cannot see: every document that enumerates the levels must name all of them. The `xhigh` widening passed the original gate while four user-facing surfaces still said there were three, and Claude reads the command markdown and the runtime skill before it ever builds the bridge call. That sweep now includes `grok-bridge.mjs` itself, whose three usage lines were the fourth of those surfaces and had been corrected by hand twice with nothing watching them.
 
-- **The README now says how to update, and admits that nothing tells you to.** An
-  installed plugin stays at the version it was installed at, and publishing a release
-  does not reach it; Claude Code's marketplace auto-update is off by default for the
-  local and third-party sources this plugin installs from. The instructions also start
-  with `git pull`, because the marketplace *is* your clone — refreshing it re-reads a
-  directory rather than fetching, so without that step both plugin commands succeed and
-  leave you on the old build. That gap is why this fix needed documenting as much as
-  writing.
-- Troubleshooting covers the symptom above, including the silent exit-0 form, so it is
-  attributed to the Bash tool rather than to a run that appeared to do nothing.
-- The README no longer states a unit-test count. It was wrong — 316 against an actual
-  333 — and a number that cannot go stale is better than one that is merely correct
-  today.
+- [fork] **Read-only was removing four tools; it now removes fourteen.** The list had gone stale against the CLI's own registry, and `write` was observed being called — stopped only by the deny rules, one layer further in. Now removed: the shell, the file editor, both MCP meta-tools, `write`, `monitor`, the four media generators, `web_fetch`, and all three scheduler tools. If you relied on a read-only run generating an image or fetching a URL, that is the behaviour change in this release most likely to affect you — use `--write` deliberately instead.
+
+  `scheduler_list` is on the list for a second reason worth knowing: the CLI's tools declare requirements on each other, so removing `scheduler_create` while leaving `scheduler_list` stops a session from starting at all. An id can be real and still be fatal to remove alone.
+
+- [fork] **`CLAUDE_PLUGIN_DATA` could reach your shell with its backslashes eaten.** The hook wrote each variable twice — a quoted `export` line and a bare one — in that order, and the bare line wins in a shell. So `C:\Users\you\...` arrived as `C:Usersyou...`, in the variable that names where every run's state and accounting is kept. The quoted form is now the one that survives, and the bare line is written only when the value cannot do anything in a shell.
+
+- [fork] **The hook could silently reorder another tool's lines in that same file.** It rewrote its own variables and put them back at the *end*, so a line some other hook had written after ours moved in front of it — on every session start, resume and compaction. The block now goes back where it already was. Two more from the same rewrite: a session start that changes nothing now writes nothing at all, instead of replacing the whole file to produce identical bytes, which matters because SessionStart also fires on resume and on compaction; and both variables go out in one pass rather than one each, so there is no moment when a shell can see the session id updated and the state root not.
+
+  **And the hook now says something when it cannot use that file at all, instead of failing silently or loudly in the wrong direction.** A read it cannot perform prints a warning naming the file and the errno, where it used to return without a word and leave you with stale variables and no reason. A write it cannot perform prints the same kind of warning and lets the rest of SessionStart continue — it used to throw, which took down everything else the hook had left to do over a variable that is a convenience.
+
+- [fork] **Reclaiming an abandoned run could terminate a different agent.** When a job's record went stale while its process was still alive, reclaim waited fifteen minutes and then killed it — and the only evidence the process was still *ours* was a match on the executable's base name, through a comparator that returns true whenever the record carries no fingerprint or the probe fails. Fifteen minutes is ample time for the tracked process to have exited and the operating system to have reissued its pid, and on a machine running several agents the process holding a recycled pid is most likely another agent with an identical image. An abandoned-but-alive run is still moved out of the active list, its spend still marked incomplete rather than zero, and its kill targets still kept — but nothing is signalled automatically now. The log names the live pids and `stop` ends them.
+
+- [fork] **The hook was deleting other hooks' blank lines** from that shared file. It rewrites its own lines and must leave everything else exactly as found.
+
+- [upstream] **The bridge could silently do nothing when installed behind a symlink or junction**, exiting 0 with no output — indistinguishable from a run that found nothing to say. It compared a normalised path against a resolved one; those differ behind a link.
+
+- [fork] **The bridge claimed kernel sandbox enforcement on every platform except Windows.** Every `run` reported the sandbox as an active third layer of confinement on any non-Windows system — Linux, macOS, and also FreeBSD, Android and anything else Node runs on, none of which xAI documents a mechanism for. The test was literally `platform !== "win32"`. Even for Linux the claim was too strong: Landlock is a kernel configuration option, and mainstream images including Raspberry Pi OS ship without it, so the flag is accepted, a write can land, and the CLI says nothing.
+
+  It now reports what it can establish: enforced where the mechanism is confirmed, not enforced where it is confirmed absent, and **unverified** where it cannot tell. ⚠ **The barrier you rely on has not changed and never depended on this** — the writing tools are removed and deny rules applied, on every platform.
+
+  **And `review` and `critique` now carry that disclosure too.** They launched with the same tool removal and the same sandbox flag as `run`, but their result carried no confinement field and no warning at all — so the one command that told you where the barrier stood was the one you were least likely to be using for somebody else's repository.
+
+- [fork] **`stop` could report a process gone because a message said so**, rather than because the operating system agreed. It now confirms against the OS before believing it, which is the difference between "cancelled" and "cancelled, still running, still spending".
+
+- [fork] **`runs` now says when a stop would have to match on name alone.** Each record stores the image name of the process it started so a kill can compare identity before signalling, but when that probe fails at start-up the weaker guarantee was recorded and never displayed — so a job that could only ever be matched by name looked exactly like one that could be matched by identity. The listing and `runs <id>` now carry "⚠ Process fingerprint unavailable — stop matches on name alone, not identity." ⚠ Two things this is not: it is a property of the *job* rather than a report about a kill, so the output of `/grok-build:stop` is unchanged; and it appears in `runs` only — `show` renders a stored result through a different path and does not carry it.
+
+- [fork] **`usage` created the state root it was reporting on.** It is a read-only diagnostic and it tells you whether the state root existed before it ran — and it cached a subscription hint by first creating that directory, so the first invocation reported "did not exist" and brought it into being, and every invocation after saw nothing wrong. A mistyped or unset `CLAUDE_PLUGIN_DATA` therefore left a real directory behind, which is also where one leaked temp directory per test run had been coming from. It now writes the hint only if the state root is already there; without one there is no ledger for a hint to sit beside anyway.
+
+- [fork] A failed review printed its headline twice, once as the summary and again under `Details:`.
+
+- [fork] **A nudged read-only run recorded only the second attempt's spend.** When a turn came back empty, the bridge resumes the session once with a nudge; the retry replaced the first result wholesale, so two CLI launches were billed and only the second attempt's usage, cost and turn count reached the ledger — and `usageIncomplete` stayed false, because the retry carried usage and nothing asked what was missing. The command the README tells you to budget against then under-reported spend, hardest exactly where it hurts most: the nudge fires when a turn produced no text, which is what exhausting `--max-turns` emits. Both attempts are summed now; if either went unmeasured the record is marked incomplete rather than presented as exact.
+
+- Documentation, each claim re-checked against the code: `SECURITY.md` and the README no longer key sandbox enforcement to a platform name; `SECURITY.md` no longer says a sub-agent "cannot escape the barrier, that was tested" — what is tested is the argv this bridge builds on every launch path, and whether a Grok-spawned subagent inherits the removal list is a property of the CLI that nothing here pins; and the shipped command count was one too high once import went.
+
+### Security
+
+- [upstream] **Gathering review context is now hardened against programs the reviewed repository asks git to run.** Collecting a review runs `git` inside the target directory, before the agent is launched and therefore before the read-only barrier applies to anything. Several git settings take a *command* as their value, and git honours the ones a repository carries in its own configuration. **A repository can also simply ship a hook**: `git status` rewrites the index whenever it finds a stale stat entry to refresh, and that alone was enough to execute a `post-index-change` script — from the default `.git/hooks` directory, needing no configuration entry at all, which is why sweeping config keys never found it. ⚠ **Not every `git status` writes the index**, and the difference is worth stating precisely rather than leaving as folklore: where the only change is a modified file, git reports it and leaves the stat cache alone, which measured here as between one invocation in fifteen and two in five doing nothing at all. ⚠ **Do not read that as a mitigation.** How often it happens is a property of what the repository contains, and the repository is precisely the thing you do not control, so a defender gains nothing from the rate. The hardening is unconditional for that reason. Hooks are now disabled outright for every git invocation used to collect context, and the command-valued settings are neutralised — those with attacker-chosen names enumerated per repository, across both the local and worktree scopes, rather than assumed.
+
+  **What this does not claim.** git trusts a local `.git/config` by design; there is no "untrusted repository" mode to switch on. This is defence in depth against the mechanisms we identified and measured, not a guarantee that none remain — a future git may add another command-valued setting and this code will not know about it. Cloning before you review removes the case where the repository carries its own command strings, and is worth doing when you have been handed a directory rather than a URL. ⚠ **It is not a complete defence either**, because a clone still carries `.gitattributes`, and an attribute naming a filter you have configured globally runs *your* program during collection. `SECURITY.md` says what remains.
+
+  ⚠ **One behaviour change to know about if you use local filters.** Where a repository declares its own `filter.<name>.clean`, that filter no longer runs while the review context is built, and **git treats a neutralised `required` filter as a failure**: collection aborts with `fatal: … clean filter … failed` rather than skipping quietly. Measured, and it is the common case rather than the exotic one — `git lfs install --local` and git-crypt both set `required`, so a repository configured with either will fail to collect instead of producing a review.
+
+  Where such a filter is *not* required, the untransformed working-tree bytes are what reach the model instead of the transformed ones. ⚠ An earlier draft of this entry named git-crypt as that case; that was wrong, and testing it is what showed so — git-crypt sets `required = true`, so it aborts rather than exposing plaintext. The disclosure concern applies only to a non-required transforming filter, which is the rarer arrangement.
+
+  The cost is real and deliberate: a repository using a converter to make PDFs, Word files, exif or jq output readable no longer gets the converted text in a review. What reaches the model instead is the raw thing — an embedded `GIT binary patch` block for a genuinely binary file, since these diffs are built with `--binary`, and an ordinary text diff of the underlying JSON or XML where the file was text all along.
+
+  Submodules cost more than that. Asking whether a submodule is dirty starts a second `git` inside it, and the parent's protections do not all reach that child — a filter declared only in the submodule ran through it. The file listing and the status output therefore now exclude submodules entirely, while the content diffs summarise submodule changes rather than inlining them. ⚠ **Those two are not consistent with each other**, and the practical effect is that a modified submodule may be absent from the list of changed files while still being mentioned in the diff. Reviewing a superproject is correspondingly less useful; review the submodule directly if it is what you care about.
+
+  ⚠ **One more consequence, and it changes what gets reviewed rather than how it is rendered.** Because the status output now ignores submodules, a repository whose *only* modification is a dirty submodule — or a staged submodule pointer bump — reads as clean. Under the default `--scope auto` that flips the choice: instead of reviewing your working tree, the run reviews the branch against its base. You get a review, it is simply of something else, and nothing announces the switch. Pass `--scope working-tree` explicitly when the submodule is the change you meant.
+
+  ⚠ Written as the fix rather than the defect, on purpose. The same code is present upstream at `92b76a6` and has not been reported there, so the mechanisms are withheld until they are fixed or published — per the `[upstream]` note at the top of this file.
 
 ### Verified
 
-- **Grok CLI 1.0.0.** The acceptance suite passes 11/11 on Windows and on a Raspberry
-  Pi (aarch64) against 1.0.0, covering the write barrier, write mode, structured
-  output, thread continuity, six-way concurrency and crash recovery — and an induced
-  timeout confirms the failure path still classifies and renders correctly.
-  ⚠ The `quota-exhausted` and `not-authenticated` envelope shapes are captured from
-  0.2.117 and could not be induced non-destructively; they are **unverified** against
-  1.0.0.
+- **458 unit tests**, and the acceptance suite green on two hosts against this build: **14 of 14 on Windows**, **13 of 13 on a Raspberry Pi** (aarch64, Linux 6.12.96), where the sandbox control correctly skips because that kernel provides no mechanism to test — a skip, not a pass.
+
+- The read-only barrier is now asserted on the launches nobody was checking: the retry after an empty answer, and `review` and `critique`, which had been trusted to inherit it because they share a helper.
+
+- The acceptance suite states which build it checked, and fails its first step when that build is not this tree. ⚠ It does not *stop* there: the remaining steps still run, still drive the real Grok CLI and still spend allowance, so a mismatch costs you a full run before the summary tells you it graded the wrong thing. It had been reporting green against an installed 0.3.0 while the tree was 0.3.3 — three releases behind.
+
+## [0.3.2] — 2026-08-07
+
+One defect and the means of finding out about it. **Update if you are on any earlier version**, because the bug does not look like this plugin's fault.
+
+### Fixed
+
+- [upstream] **The SessionStart hook could break your shell, and you would never have suspected us — and it was not this fork's mistake.** The upstream plugin appends to `CLAUDE_ENV_FILE` on every SessionStart with no rewrite, so the file grows without bound; anyone running the original still has this. It appended to `CLAUDE_ENV_FILE` on every SessionStart — and SessionStart fires on every start, resume and compaction, not once per session. Claude Code inlines that whole file into the `bash -c` argument of every Bash tool call, and a `bash -c` argument past 8186 characters is truncated **silently** on Windows. So after roughly fifteen session events the file crossed that limit and the command at the end of the argument was severed: bash then reported a parse error on an innocent line, or — when the cut landed on a line boundary — returned **exit 0 with empty output, having run nothing at all**. That second form is the dangerous one: it is indistinguishable from a genuine "no matches" or "tests pass".
+
+  The hook now rewrites its own lines instead of appending. It also repairs a file an earlier version already bloated, on the next SessionStart, so no manual cleanup is needed. Measured before the fix: six sessions on one machine dead, the worst holding 57 copies of each variable at 15 KiB.
+
+- An unreadable `CLAUDE_ENV_FILE` no longer crashes the hook or overwrites the file. Only "does not exist" is treated as empty; any other read error aborts without writing, because the write is a whole-file replacement and three run back to back.
+
+### Changed
+
+- **The README now says how to update, and admits that nothing tells you to.** An installed plugin stays at the version it was installed at, and publishing a release does not reach it; Claude Code's marketplace auto-update is off by default for the local and third-party sources this plugin installs from. The instructions also start with `git pull`, because the marketplace *is* your clone — refreshing it re-reads a directory rather than fetching, so without that step both plugin commands succeed and leave you on the old build. That gap is why this fix needed documenting as much as writing.
+- Troubleshooting covers the symptom above, including the silent exit-0 form, so it is attributed to the Bash tool rather than to a run that appeared to do nothing.
+- The README no longer states a unit-test count. It was wrong — 316 against an actual 333 — and a number that cannot go stale is better than one that is merely correct today.
+
+### Verified
+
+- **Grok CLI 1.0.0.** The acceptance suite passes 11/11 on Windows and on a Raspberry Pi (aarch64) against 1.0.0, covering the write barrier, write mode, structured output, thread continuity, six-way concurrency and crash recovery — and an induced timeout confirms the failure path still classifies and renders correctly. ⚠ The `quota-exhausted` and `not-authenticated` envelope shapes are captured from 0.2.117 and could not be induced non-destructively; they are **unverified** against 1.0.0.
 
 ## [0.3.1] — 2026-08-02
 
@@ -64,184 +142,77 @@ No new capability. Everything here answers review of the published 0.3.0 tree.
 
 ### Added
 
-- `ROADMAP.md`: what is planned, what is not, and the release rule — including a
-  read-only mode that cannot reach the network, and multimodal support.
+- `ROADMAP.md`: what is planned, what is not, and the release rule — including a read-only mode that cannot reach the network, and multimodal support.
 
 ### Fixed
 
-- **A failed run names its cause on the first line.** It used to open with the
-  CLI's raw error envelope and state the reason underneath. For an exhausted
-  allowance that envelope begins "Internal error", so a billing refusal read as
-  a crash in this plugin. One headline table is now shared by every surface that
-  has to state a cause in words — the rendered output of a run, a review and a
-  critique, the `runs` summary, and the `show` detail — and it covers all seven
-  failure codes rather than only quota and auth. The envelope is kept below it,
-  because on a truncated run it holds the partial answer.
-- The live progress line names a refusal once the cause is known. It used to
-  report only the exit status, because it fires before the failure is classified;
-  a second line is now emitted for quota and for a missing sign-in, the two cases
-  where retrying cannot help and the reader has to do something else. It stays a
-  progress field: the verdict belongs to the summary, which `runs` prints first
-  for a finished job and which `show` states in the same words.
+- **A failed run names its cause on the first line.** It used to open with the CLI's raw error envelope and state the reason underneath. For an exhausted allowance that envelope begins "Internal error", so a billing refusal read as a crash in this plugin. One headline table is now shared by every surface that has to state a cause in words — the rendered output of a run, a review and a critique, the `runs` summary, and the `show` detail — and it covers all seven failure codes rather than only quota and auth. The envelope is kept below it, because on a truncated run it holds the partial answer.
+- The live progress line names a refusal once the cause is known. It used to report only the exit status, because it fires before the failure is classified; a second line is now emitted for quota and for a missing sign-in, the two cases where retrying cannot help and the reader has to do something else. It stays a progress field: the verdict belongs to the summary, which `runs` prints first for a finished job and which `show` states in the same words.
 - The turn count is recovered from a failure payload, in either spelling.
 
 ### Changed
 
-- `SECURITY.md` no longer lists `DISABLE_ERROR_REPORTING=1`. The name matches
-  neither the forwarded prefixes nor the exact allowlist, so the env filter
-  strips it before the CLI starts: it was a control that looked applied and was
-  not. It is also absent from the CLI's own documented variable list.
-- **`SECURITY.md` now says that fetched content is untrusted input too, not only
-  repository content.** Read-only removes the shell, the file editor and the two
-  MCP meta-tools and denies `Bash`/`Write`/`Edit`/`MCPTool` — several of which
-  can reach the network, so removing them closes those paths too — while
-  `web_search` is deliberately kept. The mode therefore shuts most outbound doors
-  as a side effect of being a write barrier, without being a network barrier, and
-  the document described only half of what that implies. Prompted by a reader
-  asking exactly the question the document could not answer.
-- The Windows sandbox is described as **not enforced** rather than as doing
-  nothing, in `SECURITY.md`, `README.md` and `docs/ADOPTION.md`. xAI documents
-  Landlock and Seatbelt and names no Windows mechanism; that is an absence rather
-  than a documented no-op. The claim that a sandbox-only write was "reproduced"
-  on Windows is withdrawn — no test, log or artifact for it exists in this
-  repository, and the design argument does not need it.
-- The README no longer headlines read-only as "safe to point at code you did not
-  write", which promised more than `SECURITY.md` delivers: the mode defends the
-  integrity of your machine and not the confidentiality of what it reads. The FAQ
-  on a spent allowance now describes what the output actually looks like rather
-  than only which `failureCode` is set.
+- `SECURITY.md` no longer lists `DISABLE_ERROR_REPORTING=1`. The name matches neither the forwarded prefixes nor the exact allowlist, so the env filter strips it before the CLI starts: it was a control that looked applied and was not. It is also absent from the CLI's own documented variable list.
+- **`SECURITY.md` now says that fetched content is untrusted input too, not only repository content.** Read-only removes the shell, the file editor and the two MCP meta-tools and denies `Bash`/`Write`/`Edit`/`MCPTool` — several of which can reach the network, so removing them closes those paths too — while `web_search` is deliberately kept. The mode therefore shuts most outbound doors as a side effect of being a write barrier, without being a network barrier, and the document described only half of what that implies. Prompted by a reader asking exactly the question the document could not answer.
+- The Windows sandbox is described as **not enforced** rather than as doing nothing, in `SECURITY.md`, `README.md` and `docs/ADOPTION.md`. xAI documents Landlock and Seatbelt and names no Windows mechanism; that is an absence rather than a documented no-op. The claim that a sandbox-only write was "reproduced" on Windows is withdrawn — no test, log or artifact for it exists in this repository, and the design argument does not need it.
+- The README no longer headlines read-only as "safe to point at code you did not write", which promised more than `SECURITY.md` delivers: the mode defends the integrity of your machine and not the confidentiality of what it reads. The FAQ on a spent allowance now describes what the output actually looks like rather than only which `failureCode` is set.
 
 ## [0.3.0] — 2026-08-01
 
-First public release. Fork of xAI's grok-build Claude Code plugin; the entries
-below are what differs from the upstream baseline, `5a9f924 feat: Grok Build
-Claude Code plugin`, which resolves in the upstream repository.
+First public release. Fork of xAI's grok-build Claude Code plugin; the entries below are what differs from the upstream baseline, `5a9f924 feat: Grok Build Claude Code plugin`, which resolves in the upstream repository.
+
+**Everything in this section is `[upstream]` by construction.** It was the fork's first release, so every defect fixed here is one the original had and, unless it says otherwise, still has. The per-entry markers described at the top of this file begin at 0.3.2, which is where fixes to our own code started to mix in with fixes to inherited code.
 
 ### Added
 
-- Named threads: `run --thread <name>` with a per-workspace registry
-  (`named-threads.json`) so conversational follow-ups continue the same Grok
-  session across separate bridge invocations; per-thread lock so two runs
-  cannot interleave one session.
-- Structured schema output: `run --json-schema <json>` passes through to the
-  CLI's constrained decoding; parsed result exposed as `payload.structured`;
-  unparseable schema output fails the run (exit 2).
-- Machine-wide concurrency slots: file-based semaphore in the shared state
-  root caps concurrent Grok agents across all workspaces and sessions
-  (`GROK_CC_MAX_CONCURRENCY` override; `0` disables the semaphore).
-- `failureCode` in JSON payloads (`no-deliverable` / `schema-parse` /
-  `cli-error`) to disambiguate non-zero exits.
-- Prompt handover via `--prompt-file` so long review/critique contexts do not
-  hit the Windows command-line length limit.
-- Fork-hardening regression tests (JSON scanner, thread registry/locks, lock
-  ownership, slot capping, executable resolution, read-only barrier flags).
-- Wall-clock control: `--timeout-ms` kills a stuck agent run and fails it with
-  `failureCode: timeout`; it also serves as the wait deadline for `runs` and
-  `show --wait`, which exit `3` when the deadline passes.
-- Output capture cap (`GROK_CC_STDOUT_CAP_BYTES`, default 32 MiB). Exceeding it
-  fails the run with `output-truncated` instead of returning a partial answer
-  as if it were complete.
-- Batch prompts: `run --prompts-file <ndjson>` runs a sequence of prompts in one
-  invocation.
-- Cross-session visibility: `runs --all-sessions` lists every job in the
-  workspace regardless of which Claude session started it.
-- `run --fresh` forces a new Grok session, including when `--thread` names a
-  thread that has a stored session.
-- `usage` reports what the runs cost: per-run `total_cost_usd` and token counts
-  aggregated across workspaces, plus the subscription's weekly percentage read
-  from the CLI's own local log when one is there. That percentage is an
-  unsupported side channel — reported, never enforced, and it fails open.
+- Named threads: `run --thread <name>` with a per-workspace registry (`named-threads.json`) so conversational follow-ups continue the same Grok session across separate bridge invocations; per-thread lock so two runs cannot interleave one session.
+- Structured schema output: `run --json-schema <json>` passes through to the CLI's constrained decoding; parsed result exposed as `payload.structured`; unparseable schema output fails the run (exit 2).
+- Machine-wide concurrency slots: file-based semaphore in the shared state root caps concurrent Grok agents across all workspaces and sessions (`GROK_CC_MAX_CONCURRENCY` override; `0` disables the semaphore).
+- `failureCode` in JSON payloads (`no-deliverable` / `schema-parse` / `cli-error`) to disambiguate non-zero exits.
+- Prompt handover via `--prompt-file` so long review/critique contexts do not hit the Windows command-line length limit.
+- Fork-hardening regression tests (JSON scanner, thread registry/locks, lock ownership, slot capping, executable resolution, read-only barrier flags).
+- Wall-clock control: `--timeout-ms` kills a stuck agent run and fails it with `failureCode: timeout`; it also serves as the wait deadline for `runs` and `show --wait`, which exit `3` when the deadline passes.
+- Output capture cap (`GROK_CC_STDOUT_CAP_BYTES`, default 32 MiB). Exceeding it fails the run with `output-truncated` instead of returning a partial answer as if it were complete.
+- Batch prompts: `run --prompts-file <ndjson>` runs a sequence of prompts in one invocation.
+- Cross-session visibility: `runs --all-sessions` lists every job in the workspace regardless of which Claude session started it.
+- `run --fresh` forces a new Grok session, including when `--thread` names a thread that has a stored session.
+- `usage` reports what the runs cost: per-run `total_cost_usd` and token counts aggregated across workspaces, plus the subscription's weekly percentage read from the CLI's own local log when one is there. That percentage is an unsupported side channel — reported, never enforced, and it fails open.
 
 ### Changed
 
-- Read-only runs no longer use interactive plan mode (`--no-plan` + sandbox
-  read-only) so headless runs do not stall on plan approval.
-- Run output uses `--output-format json` for exact `finalMessage`, session id,
-  turns, stop reason, and usage in the payload.
-- Default concurrency bound raised from 3 to a self-scaling value (measured
-  safe at high parallelism): `max(8, 2 × logical CPUs)`; the bound is a
-  runaway guard, not a correctness requirement.
-- Queue overflow starts the run after a short wait instead of failing it
-  (backpressure only; work is not discarded).
-- Default queue wait shortened (15 minutes → 90 seconds) so waiting for a slot
-  does not become its own stall.
-- Delegate agent and runtime skill aligned with fork defaults: read-only
-  unless `--write`, pass-through of `--thread` / `--json-schema`, trust exit
-  codes, surface error output.
-- Deliverable gate treats non-empty output as success; a non-`EndTurn`
-  stopReason no longer discards usable text.
-- Schema parsing prefers the CLI's `structuredOutput` and otherwise takes the
-  last JSON object in the text; also accepts concatenated schema objects.
-- Job ids from the command line are validated before path join; `run` stops
-  parsing options at the first prompt word so an unquoted `--write` inside a
-  task description cannot grant write access.
-- Documentation aligned with runtime contracts: review/critique described as a
-  read-only write barrier (not plan mode); concurrency default
-  `max(8, 2 × CPUs)`, 90s wait-then-start, env knobs, and per-user fallback
-  state root; one background ownership model (bridge `--background` owns the
-  process group); `failureCode` as the real exit discriminator with read-only
-  nudge, and review/critique documented as applying the same deliverable gate
-  as `run` rather than forwarding CLI status; slash argument-hints and
-  operator Operations section (SessionEnd, Windows install, state layout,
-  failure modes); thread name rules, `--json-schema` 16k cap, and
-  `--background`/`--wait` precedence documented.
-- SessionEnd keeps job history: it cancels the session's active jobs and stops
-  their processes, but no longer rewrites the workspace job list, so finished
-  records survive for `show` and `runs --all-sessions`. Retention is the
-  `MAX_JOBS` prune plus the explicit `clean` command.
+- Read-only runs no longer use interactive plan mode (`--no-plan` + sandbox read-only) so headless runs do not stall on plan approval.
+- Run output uses `--output-format json` for exact `finalMessage`, session id, turns, stop reason, and usage in the payload.
+- Default concurrency bound raised from 3 to a self-scaling value (measured safe at high parallelism): `max(8, 2 × logical CPUs)`; the bound is a runaway guard, not a correctness requirement.
+- Queue overflow starts the run after a short wait instead of failing it (backpressure only; work is not discarded).
+- Default queue wait shortened (15 minutes → 90 seconds) so waiting for a slot does not become its own stall.
+- Delegate agent and runtime skill aligned with fork defaults: read-only unless `--write`, pass-through of `--thread` / `--json-schema`, trust exit codes, surface error output.
+- Deliverable gate treats non-empty output as success; a non-`EndTurn` stopReason no longer discards usable text.
+- Schema parsing prefers the CLI's `structuredOutput` and otherwise takes the last JSON object in the text; also accepts concatenated schema objects.
+- Job ids from the command line are validated before path join; `run` stops parsing options at the first prompt word so an unquoted `--write` inside a task description cannot grant write access.
+- Documentation aligned with runtime contracts: review/critique described as a read-only write barrier (not plan mode); concurrency default `max(8, 2 × CPUs)`, 90s wait-then-start, env knobs, and per-user fallback state root; one background ownership model (bridge `--background` owns the process group); `failureCode` as the real exit discriminator with read-only nudge, and review/critique documented as applying the same deliverable gate as `run` rather than forwarding CLI status; slash argument-hints and operator Operations section (SessionEnd, Windows install, state layout, failure modes); thread name rules, `--json-schema` 16k cap, and `--background`/`--wait` precedence documented.
+- SessionEnd keeps job history: it cancels the session's active jobs and stops their processes, but no longer rewrites the workspace job list, so finished records survive for `show` and `runs --all-sessions`. Retention is the `MAX_JOBS` prune plus the explicit `clean` command.
 
 ### Fixed
 
-- Honest exit codes: exit `0` only when a deliverable exists; exit `2` when
-  the bridge detects no deliverable (after one automatic nudge) or unparseable
-  schema output.
-- The truncation gate covers `review` and `critique`, not just `run`. A
-  truncated plain review still has text, so it used to be reported as a
-  finished review; a truncated critique usually fails to parse and was
-  reported as `schema-parse`, blaming the model for output the bridge cut off.
-- State lock hardening: retry `EPERM`/`EACCES`/`EBUSY` (Windows contention),
-  jittered backoff, token ownership on release, liveness-first steal with age
-  backstop, deadline that exceeds reclaim thresholds, self-heal when a
-  recycled pid still looks alive.
-- Global slot ownership-checked release; one reclaim attempt per slot per
-  pass; absolute wait ceiling; async waiting so the event loop keeps turning.
-- Envelope detection requires a real envelope shape so model text containing a
-  `"text"` key is not mistaken for the CLI envelope.
-- Thread registered only on success; registration failure surfaces; background
-  path accepts `--thread` like the foreground path.
-- One concurrency slot held across a run and its nudge; failed nudge no longer
-  discards the first result; nudge never re-runs `--write` tasks unattended.
-- Windows: resolve executables via `PATHEXT` and spawn directly (no shell) —
-  removes the "Select an app to open 'grok'" dialog and MSYS-mangled
-  `taskkill` arguments; no shell fallback when a binary cannot be resolved.
-- Script entry points (`GROK_BINARY=*.mjs`) run through the current Node
-  binary.
+- Honest exit codes: exit `0` only when a deliverable exists; exit `2` when the bridge detects no deliverable (after one automatic nudge) or unparseable schema output.
+- The truncation gate covers `review` and `critique`, not just `run`. A truncated plain review still has text, so it used to be reported as a finished review; a truncated critique usually fails to parse and was reported as `schema-parse`, blaming the model for output the bridge cut off.
+- State lock hardening: retry `EPERM`/`EACCES`/`EBUSY` (Windows contention), jittered backoff, token ownership on release, liveness-first steal with age backstop, deadline that exceeds reclaim thresholds, self-heal when a recycled pid still looks alive.
+- Global slot ownership-checked release; one reclaim attempt per slot per pass; absolute wait ceiling; async waiting so the event loop keeps turning.
+- Envelope detection requires a real envelope shape so model text containing a `"text"` key is not mistaken for the CLI envelope.
+- Thread registered only on success; registration failure surfaces; background path accepts `--thread` like the foreground path.
+- One concurrency slot held across a run and its nudge; failed nudge no longer discards the first result; nudge never re-runs `--write` tasks unattended.
+- Windows: resolve executables via `PATHEXT` and spawn directly (no shell) — removes the "Select an app to open 'grok'" dialog and MSYS-mangled `taskkill` arguments; no shell fallback when a binary cannot be resolved.
+- Script entry points (`GROK_BINARY=*.mjs`) run through the current Node binary.
 
 ### Security
 
-- Real write barrier on read-only runs: `--disallowed-tools` removes
-  `run_terminal_cmd` / `search_replace` / `search_tool` / `use_tool`,
-  `--deny` rules block
-  `Bash` / `Write` / `Edit` / `MCPTool`, with `--sandbox read-only` retained
-  for kernel enforcement where the OS provides it. The sandbox is not relied on
-  as the barrier: it is not enforced on Windows, so the tool layer carries it on
-  every platform.
-- No shell fallback on Windows when resolving binaries (removes remaining
-  ShellExecute / interpolation surface).
-- Job-id path validation prevents directory escape via `show` / similar
-  commands.
-- Thread names validated (no `__proto__` / path characters); `--json-schema`
-  must be a JSON object and is size-checked against command-line limits.
+- Real write barrier on read-only runs: `--disallowed-tools` removes `run_terminal_cmd` / `search_replace` / `search_tool` / `use_tool`, `--deny` rules block `Bash` / `Write` / `Edit` / `MCPTool`, with `--sandbox read-only` retained for kernel enforcement where the OS provides it. The sandbox is not relied on as the barrier: it is not enforced on Windows, so the tool layer carries it on every platform.
+- No shell fallback on Windows when resolving binaries (removes remaining ShellExecute / interpolation surface).
+- Job-id path validation prevents directory escape via `show` / similar commands.
+- Thread names validated (no `__proto__` / path characters); `--json-schema` must be a JSON object and is size-checked against command-line limits.
 
 ### Note on the marketplace identifier
 
-This plugin registers under `claude-code-grok-bridge`, not upstream's
-`xai-grok-build`. The id is part of the install cache path, so a distinct one lets
-the official plugin and this fork coexist on the same machine — and Claude Code
-2.1.196 handles a collision badly: it accepts a duplicate id without warning, then
-fails to load the plugin and points at whichever path was registered last.
+This plugin registers under `claude-code-grok-bridge`, not upstream's `xai-grok-build`. The id is part of the install cache path, so a distinct one lets the official plugin and this fork coexist on the same machine — and Claude Code 2.1.196 handles a collision badly: it accepts a duplicate id without warning, then fails to load the plugin and points at whichever path was registered last.
 
-⚠ `claude plugin uninstall` deletes the plugin's data directory — the job records
-and the local spend ledger — silently, while exiting 0 (measured against Claude
-Code 2.1.196). Copy `~/.claude/plugins/data/<marketplace-id>/` first if those
-matter to you.
+⚠ `claude plugin uninstall` deletes the plugin's data directory — the job records and the local spend ledger — silently, while exiting 0 (measured against Claude Code 2.1.196). Copy `~/.claude/plugins/data/<marketplace-id>/` first if those matter to you.

@@ -766,7 +766,27 @@ export function terminateProcessTree(pid, options = {}) {
 
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
     if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
-      return { attempted: true, delivered: false, gone: true, method: "taskkill", result };
+      // Text is weaker evidence than the exit code, and the exit code was already judged
+      // too weak twelve lines up. A "not found" message can name a DESCENDANT the tree
+      // walk lost rather than the target, it can arrive on a localised system where the
+      // match is approximate, and it can describe a pid that has since been recycled —
+      // none of which proves this pid is gone. Concluding it anyway takes the unsafe
+      // direction: `gone: true` settles the kill target, `stop` then skips restoring the
+      // pids after the terminal claim has already nulled them, and a live agent keeps
+      // running and spending under a record that no longer names it.
+      //
+      // So confirm it the way the exit-128 path does, for one `kill(pid, 0)`. Steerable
+      // through `isGoneImpl` for the same reason as there: a test stubbing
+      // `runCommandImpl` for taskkill must not have it field liveness probes too.
+      const goneAfterMessage = options.isGoneImpl
+        ? options.isGoneImpl(pid) === true
+        : isProcessGone(pid, killImpl);
+      if (goneAfterMessage) {
+        return { attempted: true, delivered: false, gone: true, method: "taskkill", result };
+      }
+      // The message said missing and the OS disagrees. Believe the OS, leave the target
+      // unsettled, and let the record keep its pids.
+      return { attempted: true, delivered: false, method: "taskkill", result };
     }
 
     // ENOENT: no taskkill on PATH at all. ETIMEDOUT: taskkill was started but cut off at

@@ -1,68 +1,47 @@
 # Claude Code ↔ Grok Build Bridge
 
-**Give Claude Code a second model to hand work to.** A diff to review, a problem you
-are stuck on, a job long enough that you would rather not sit and watch it — Grok takes
-it and answers back into the session you are already working in. A marketplace plugin
-that shells out to the real `grok` CLI; no broker, no service in between.
+[![tests](https://img.shields.io/github/actions/workflow/status/kai-wedekind/claude-code-grok-bridge/test.yml?branch=main&label=tests)](https://github.com/kai-wedekind/claude-code-grok-bridge/actions/workflows/test.yml) [![release](https://img.shields.io/github/v/release/kai-wedekind/claude-code-grok-bridge)](https://github.com/kai-wedekind/claude-code-grok-bridge/releases/latest) [![license](https://img.shields.io/github/license/kai-wedekind/claude-code-grok-bridge)](LICENSE) [![last commit](https://img.shields.io/github/last-commit/kai-wedekind/claude-code-grok-bridge)](https://github.com/kai-wedekind/claude-code-grok-bridge/commits/main)
 
-It bills to your Grok account rather than to Claude quota. If you already pay for a plan
-that includes Grok — an X Premium subscription, say, though which plans include what is
-xAI's to define, so check their current terms — and you spend your working day in
-Claude Code, chances are you are nowhere near using what you are already paying for.
-This puts it to work without changing where you work.
+**Give Claude Code a second model to hand work to.** A diff to review, a problem you are stuck on, a job long enough that you would rather not sit and watch it — Grok takes it and answers back into the session you are already working in. A marketplace plugin that shells out to the real `grok` CLI; no broker, no service in between.
 
-The rest of the effort here went into making a delegated run trustworthy: you can see
-what it cost, stop it and know it stopped, and tell the difference between an answer and
-a failure.
+It bills to your Grok account rather than to Claude quota. If you already pay for a plan that includes Grok — an X Premium subscription, say, though which plans include what is xAI's to define, so check their current terms — and you spend your working day in Claude Code, chances are you are nowhere near using what you are already paying for. This puts it to work without changing where you work.
+
+The rest of the effort here went into making a delegated run trustworthy: you can see what it cost, stop it and know it stopped, and tell the difference between an answer and a failure.
 
 **What you get:**
 
-- **A genuinely independent second opinion.** The point is not another pass by the
-  model you are already talking to. It is a different one, with its own blind spots,
-  reading your diff or your design and disagreeing where it disagrees.
-- **Reach into 𝕏, which Claude Code cannot.** x.com is closed to it; Grok has that
-  access natively. A post URL or a research question — what shipped, what people are
-  hitting, how they worked around it — gets answered without leaving your session.
-- **Work that outlives the request.** Send a long job to the background and carry on.
-  It can be listed, inspected while it runs, and picked up afterwards, from any session.
-- **Stop that actually stops.** Cancelling terminates the process tree and confirms the
-  kill landed. A run is never marked cancelled while its agent quietly keeps going and
-  keeps spending.
-- **You can see what it costs.** Every run's reported spend is kept locally, by day and
-  by workspace. There is no quota endpoint to ask, so this is the only view you have —
-  and it separates runs that cost *nothing* from runs whose cost is *unknown*, rather
-  than scoring both as zero and flattering the total.
-- **A result, or a reason there is none.** Success means output arrived, failure names
-  which kind of failure it was, and partial output is kept and labelled as partial. The
-  exit code, the printed text and the JSON payload are not allowed to disagree.
-- **Read-only by default, and the default is real.** The writing tools are removed rather
-  than discouraged, which holds on Windows too, where the CLI's own sandbox flag is not
-  enforced. It is a write barrier, not a network barrier — web search stays available, and
-  `SECURITY.md` says what that does and does not protect. Full write access is one flag away
-  when you want it.
-- **Built for repeat use, not one-shot demos.** Conversations continue across separate
-  calls instead of restarting cold; structured output comes back as parsed JSON and
-  fails loudly rather than handing you prose that will not parse; and you can fire as
-  many runs as you like without counting what is already in flight.
-- **Nothing installed from a registry.** No dependencies, no lockfile. `git clone` plus
-  Node is the entire supply chain, and you can read all of it.
-- ⚠ Installing it does **not** make Claude Code use it. See
-  [Making Claude Code actually use it](#making-claude-code-actually-use-it) — that gap is
-  deliberate.
+- **A genuinely independent second opinion.** The point is not another pass by the model you are already talking to. It is a different one, with its own blind spots, reading your diff or your design and disagreeing where it disagrees.
+- **Reach into 𝕏, which Claude Code cannot.** x.com is closed to it; Grok has that access natively. A post URL or a research question — what shipped, what people are hitting, how they worked around it — gets answered without leaving your session.
+- **Work that outlives the request.** Send a long job to the background and carry on. It can be listed, inspected while it runs, and picked up afterwards, from any session.
+- **Stop that tells you whether it stopped.** Cancelling terminates the process tree and checks the result against the operating system rather than against a message. When the kill lands, the run is `cancelled` and done. When it does not, the run is still marked `cancelled` — but it says so, in `errorMessage`: *"Stop claimed but process may still be running (kill not delivered)."* Read that field before assuming an agent has stopped spending.
+- **You can see what it costs.** Every run's reported spend is kept locally, by day and by workspace. There is no quota endpoint to ask, so this is the only view you have — and it separates runs that cost *nothing* from runs whose cost is *unknown*, rather than scoring both as zero and flattering the total.
+- **A result, or a reason there is none.** Success means output arrived, failure names which kind of failure it was, and partial output is kept and labelled as partial. The exit code, the printed text and the JSON payload are not allowed to disagree.
+- **Read-only by default, and the default is real.** The writing tools are removed rather than discouraged, which holds on Windows too, where the CLI's own sandbox flag is not enforced. It is a write barrier, not a network barrier — web search stays available, and `SECURITY.md` says what that does and does not protect. Full write access is one flag away when you want it.
+- **Built for repeat use, not one-shot demos.** Conversations continue across separate calls instead of restarting cold; structured output comes back as parsed JSON and fails loudly rather than handing you prose that will not parse; and you can fire as many runs as you like without counting what is already in flight.
+- **Nothing installed from a registry.** No dependencies, no lockfile. `git clone` plus Node is the entire supply chain, and you can read all of it.
+- ⚠ Installing it does **not** make Claude Code use it. See [Making Claude Code actually use it](#making-claude-code-actually-use-it) — that gap is deliberate.
 
-⚠ **Windows and Linux are used in earnest. macOS is not.** The full suite runs on all
-three in CI, including tests that spawn and kill real processes — but the end-to-end
-suite that drives the actual `grok` CLI has only ever run on Windows, on Linux and on a
-Raspberry Pi, because there is no Mac here to run it on. macOS is not deliberately
-unsupported and there is no known reason it would fail; it is simply unverified in real
-use, so stable operation there is not something this project can promise. If you run it
-on a Mac and something breaks, that is a useful bug report.
+⚠ **Windows and Linux are used in earnest. macOS is not.** All 458 unit tests run on all three in CI, including tests that spawn and kill real processes — but the end-to-end suite that drives the actual `grok` CLI has only ever run on Windows, on Linux and on a Raspberry Pi, because there is no Mac here to run it on. macOS is not deliberately unsupported and there is no known reason it would fail; it is simply unverified in real use, so stable operation there is not something this project can promise. If you run it on a Mac and something breaks, that is a useful bug report.
 
-**Requires** Node ≥ 18.18 and a logged-in `grok` CLI, both on the persistent PATH.
-**Start at** [Install](#install), or the [FAQ](#faq) if you would rather have the obvious
-questions answered first — whether your code leaves the machine, whether this collides with
-xAI's own plugin, which plan you need. **Before pointing it at code you did not write,**
-read [SECURITY.md](SECURITY.md) — particularly what read-only does and does not protect.
+**Requires** Node ≥ 18.18 and a logged-in `grok` CLI, both on the persistent PATH. **Start at** [Install](#install), or the [FAQ](#faq) if you would rather have the obvious questions answered first — whether your code leaves the machine, whether this collides with xAI's own plugin, which plan you need. **Before pointing it at code you did not write,** read [SECURITY.md](SECURITY.md) — particularly what read-only does and does not protect.
+
+---
+
+## Project status
+
+⚠ **Active development is expected to stop here.** The author is cancelling his Claude subscription and discontinuing use of Claude Code, as a direct result of Anthropic's decision to [watermark Claude's output](https://support.claude.com/en/articles/16266773-how-claude-marks-ai-generated-content).
+
+The reasoning behind that decision, and what exactly was done, is set out under [Why development stopped](#why-development-stopped) below.
+
+**What it doesn't mean:** The code works and is tested: the unit suite runs on Windows and Linux in CI, and an end-to-end suite that drives the real `grok` CLI is green on Windows and on a Raspberry Pi. `SECURITY.md` describes what read-only does and does not protect, and names the residuals it does not close rather than glossing them. Nothing here is being withdrawn.
+
+It also does not mean the fork has stopped being worth having. Every defect listed under [About this fork](#about-this-fork) is one the original still has, and several of them are the kind that fail quietly: a run that reported success having produced nothing, a stop that believed a message instead of asking the operating system, a session hook that grew the host's shell environment until `bash` began failing in a way that pointed at bash rather than at this plugin, a bridge that silently did nothing when installed behind a symlink, and review context that followed a symlink out of the repository and inlined whatever it found. On top of that, this release hardens context collection against a reviewed repository getting a program run through `git` before the agent is even launched — a class the original does not address at all, closed here across five distinct mechanisms, each demonstrated and each gated by a test.
+
+The capability gap runs the same way. Per-run spend accounting against an allowance with no quota endpoint, background runs that outlive the call that started them, named threads that continue a conversation across invocations, schema-constrained structured output that fails loudly rather than returning unparseable prose, machine-wide self-scaling concurrency, failure classification where the exit code, the printed text and the JSON payload are not permitted to disagree, and visibility into what Grok's subagents actually did. `CHANGELOG.md` records each change with the reasoning and, where it matters, the measurement behind it.
+
+**What it does mean:** Expect no new features, no adaptation as either the Grok CLI or Claude Code moves underneath it, and no reliable response to issues or pull requests. Both sides of this bridge are moving targets; a plugin that is not being exercised will drift out of date without anyone noticing, and the parts most likely to go stale first are the ones pinned to the CLI's own surface — the tool-removal list and the reasoning-effort levels, both of which have already had to be corrected once for exactly that reason.
+
+**If you want it to continue**, fork it. It is Apache-2.0, there is no CLA, and nothing needs asking. xAI's own [grok-build plugin](https://github.com/xai-org/grok-build-plugin-cc) is the alternative if you would rather be on something maintained; this fork's changes and the reasoning behind each are in `CHANGELOG.md`, so a maintainer can see what to keep and what to drop.
 
 ---
 
@@ -77,7 +56,7 @@ It exists to make the bridge dependable enough to leave running: a run either pr
 Substantive changes relative to the upstream baseline, [xai-org/grok-build-plugin-cc](https://github.com/xai-org/grok-build-plugin-cc) at `5a9f924`. Each is written as the problem first, because that is what tells you whether it affects you. The fork's development history was condensed into a single commit for publication, so this list — together with `CHANGELOG.md` — *is* the record of what changed; it is not a summary of commits you can go and read here.
 
 - **A run could report success having done nothing.** Read-only work was routed through interactive plan mode, whose "present a plan and wait" branch dead-ends when there is nobody to approve it — so the run ended, exited `0`, and returned a plan instead of an answer. Plan mode is no longer used as a barrier; deliverables are detected from the CLI's own JSON, and the exit code now means something: `0` only with output, `2` without, plus a `failureCode` saying which kind of nothing you got.
-- **Read-only was not enforced on Windows.** The original relied on the CLI's `--sandbox read-only`, which that platform ignores — so the flag sat on the command line looking like protection while the agent could write anywhere. Confinement now happens at the tool layer, by removing the writing tools and adding deny rules for `Bash`/`Write`/`Edit`/`MCPTool`, which holds everywhere; the kernel sandbox is an extra layer where the OS supports it, not the load-bearing one. **`--write` unlocks full write access** in the directory you point `--cwd` at — see `SECURITY.md` for what each mode does and does not protect.
+- **Read-only rested on something not enforced on Windows.** The original relied on the CLI's `--sandbox read-only`. xAI documents enforcement through Landlock on Linux and Seatbelt on macOS and names no Windows mechanism, so there the flag is passed and the command line shows a protection that is not in force. Measured 2026-08-08 against `grok 1.0.0`, with no plugin involved: a direct run with `--sandbox read-only` created the file anyway and exited `0`. **The CLI says nothing while it happens** — stderr was empty. The warning you may have seen about this comes from the bridge, not from xAI. Confinement now happens at the tool layer, by removing the writing tools and adding deny rules for `Bash`/`Write`/`Edit`/`MCPTool`, which holds everywhere; the kernel sandbox is an extra layer where the OS supports it, not the load-bearing one. **`--write` unlocks full write access** in the directory you point `--cwd` at — see `SECURITY.md` for what each mode does and does not protect.
 - **Killing a run did not reliably kill the agent.** Stopping now terminates the real process tree and confirms it, rather than marking a record cancelled and leaving a process behind; a job whose processes are gone is reclaimed instead of sitting at "running" forever. Crash recovery is covered by the acceptance suite, not just by unit tests.
 - **Spend was invisible.** Every run draws on a paid allowance with no quota endpoint to ask. The bridge now keeps a local ledger of what each run reported — `usage` reads it, names which state root it read, and counts runs whose cost is *unknown* separately from runs that cost nothing.
 - **Long-running work had nowhere to live.** `--background` plus tracked run records, so a run survives the call that started it and can be listed, inspected and stopped afterwards.
@@ -91,16 +70,30 @@ Identity metadata in this tree names Kai Wedekind as owner/author; the plugin fu
 
 ---
 
-[Grok Build](https://x.ai) in Claude Code for review, critique, delegation, and session import. Run status, results and stop are owned by the plugin through PID and log files; there is no app-server broker.
+[Grok Build](https://x.ai) in Claude Code for review, critique and delegation. Run status, results and stop are owned by the plugin through PID and log files; there is no app-server broker.
+
+---
+
+## Why development stopped
+
+Since August 2026, text produced by new Claude models carries a statistical watermark applied [at the model level](https://www.anthropic.com/news/claude-text-watermark), across the API, Claude Code and every other surface, worldwide. It is applied to every customer. Anthropic's documentation identifies no setting, no term and no arrangement by which anyone may decline it.
+
+The stated justification is compliance with the EU AI Act. An obligation to mark generated content is a floor, not a specification, and it left Anthropic wide latitude in how to meet it. That latitude was used in one direction at every point. The mark is woven into the text itself rather than attached as detachable provenance metadata — Anthropic uses exactly that lighter mechanism for generated files, so the less invasive option was not merely available in principle but already implemented alongside. It is applied at the model level rather than per surface, so it reaches the API and developer tooling and not only the consumer product. It is applied worldwide rather than where the obligation binds. It reaches text the customer only had proofread, translated or summarised — material that was theirs before Anthropic was involved. And it is applied with no means of refusal at all. At each of those decisions a narrower reading of the requirement was available, and the broader one was taken. The regulator did not ask for this shape; Anthropic chose it, and the only forward commitment offered is that they "will continue to evaluate different approaches."
+
+The material being marked is the customer's own work — source code, prose, documents drafted, translated or summarised on their instruction, in a product they pay for. That output now carries a mark which was not disclosed at the time of purchase, was not consented to, cannot be declined, and cannot be removed. A term of the service was altered unilaterally and to the vendor's advantage after payment.
+
+**This decision is rejected here without qualification, and the rejection is the reason this project stops.** Marking a paying customer's own output is not a compliance detail. It is a supplier attaching a permanent, unremovable claim to work that the customer commissioned, paid for, and owns — and doing so undisclosed at the time of sale, unconsented, and after payment.
+
+---
 
 ## Requirements
 
 - Node.js `>= 18.18` — **on the persistent PATH**, not merely in the shell you install from. The session hooks invoke a bare `node`; where it is missing they fail silently and `GROK_CC_SESSION_ID` is never set. A portable, no-admin install is enough (unpack the Windows zip or the Linux tarball and add its directory to the user PATH).
-- Grok Build CLI (`grok`) on `PATH`, or set `GROK_BINARY`
+- Grok Build CLI (`grok`) on `PATH`, or set `GROK_BINARY`. Official documentation, including how to install it: https://docs.x.ai/build/overview
 - **Something for the CLI to bill against.** The bridge does not handle billing or authentication at all — it launches the CLI and reports what the CLI reports. So whatever makes `grok` work for you interactively will work here: a signed-in session, or `XAI_API_KEY` in the environment. Which plans and credit arrangements exist, and how they interact, is xAI's to define and change; check their current terms rather than trusting a list written here. What is worth knowing on this side is that **every run costs something**, that the bridge cannot see your remaining balance, and that the local ledger is therefore the only spend record you get.
 - A logged-in Grok CLI session — verify with `grok models`, and read what it prints rather than trusting its exit code. On the first call after the access token expires, that command can exit `0` while stating that you are *not* authenticated: it reads its auth state before the in-flight token refresh completes. Measured twice on 2026-07-31 against grok 0.2.117: the refresh took 373 ms and 441 ms, and about 690 ms passed before the model catalog was usable. `/grok-build:check` accounts for this and will not report `ready` in that state.
 - There are **no npm dependencies**. Nothing is installed from a registry, and there is no lockfile — `git clone` plus Node is the whole supply chain.
-- **Platform coverage is uneven, and the two halves are worth separating.** *Unit tests:* the full suite runs in CI on all three operating systems — Linux across Node 18.18, 20 and 22, Windows on the oldest and newest of those, macOS on the newest. A good part of that suite spawns and kills real processes rather than mocking them, so the platform-specific process handling genuinely runs on each. *End to end against the real `grok` CLI:* an eleven-gate acceptance suite covering the write barrier, structured output, thread continuity, concurrency, crash recovery and orphan cleanup — run on Windows, on Linux and on a Raspberry Pi (aarch64), and **never on macOS**, for want of the hardware. So macOS has the code exercised but not the product; expect it to work, do not expect it to be proven.
+- **Platform coverage is uneven, and the two halves are worth separating.** *Unit tests:* the full suite runs in CI on all three operating systems — Linux across Node 18.18, 20 and 22, Windows on the oldest and newest of those, macOS on the newest. A good part of that suite spawns and kills real processes rather than mocking them, so the platform-specific process handling genuinely runs on each. *End to end against the real `grok` CLI:* a fourteen-gate acceptance suite covering the write barrier, structured output, thread continuity, concurrency, crash recovery and orphan cleanup — run on Windows, on Linux and on a Raspberry Pi (aarch64), and **never on macOS**, for want of the hardware. One of those gates can SKIP rather than pass: the control that tests the CLI's own sandbox needs a kernel that offers one, and a SKIP is not a pass of that assertion. So macOS has the code exercised but not the product; expect it to work, do not expect it to be proven.
 
 ## Install
 
@@ -157,7 +150,9 @@ Or, when Claude Code is already open, use `/plugin`, add the local marketplace p
 
 *(Taking a newer **release**. For mirroring your own edits into the installed copy, see [Updating an existing install](#updating-an-existing-install) below — different job, `deploy-local.sh`.)*
 
-**Nothing here notifies you that a new version exists**, and the install above adds a step people miss: **the marketplace is your clone**, so refreshing it re-reads a directory rather than fetching anything. Updating therefore starts with git:
+**From 0.3.3 the plugin tells you when a newer release exists** — one line at session start, and a `Version:` line in `check`. It asks GitHub's public releases endpoint and nothing else; it never downloads or installs anything, and it stays silent rather than claiming you are current when the check has not run. Opt out with `GROK_CC_UPDATE_CHECK=0`. The details, including what it does when the check fails, are under [`/grok-build:check`](#grok-buildcheck).
+
+**Being told is not being updated**, and the install above adds a step people miss: **the marketplace is your clone**, so refreshing it re-reads a directory rather than fetching anything. Updating therefore starts with git:
 
 ```bash
 git -C /path/to/claude-code-grok-bridge pull
@@ -169,9 +164,9 @@ claude plugin update grok-build@claude-code-grok-bridge
 
 Then reload. Restarting Claude Code is the dependable way; `/reload-plugins` also exists. Confirm what you are actually running with `claude plugin list`, and read [CHANGELOG.md](CHANGELOG.md) or the [releases](https://github.com/kai-wedekind/claude-code-grok-bridge/releases) for what changed.
 
-> Claude Code does have an auto-update path for marketplaces, but it is off by default for local and third-party sources — which is what the install above creates. So assume updating is yours to do.
+> Claude Code does have an auto-update path for marketplaces, but it is off by default for local and third-party sources — which is what the install above creates. So assume updating is yours to do — the notice tells you, it does not act for you.
 >
-> **0.3.2 is worth taking promptly.** It repairs a defect that degraded the host's shell rather than this plugin, so an affected user would have had no reason to suspect the bridge at all.
+> **0.3.2 is worth taking promptly if you are still below it.** It repairs a defect that degraded the host's shell rather than this plugin, so an affected user would have had no reason to suspect the bridge at all.
 
 ### 3. Verify the install
 
@@ -180,13 +175,13 @@ claude plugin list            # expect: grok-build@claude-code-grok-bridge — S
 claude plugin details grok-build
 ```
 
-`details` should report 8 commands, 3 skills, 1 agent, and 2 hooks (`SessionStart`, `SessionEnd`). Then, inside Claude Code:
+`details` should report 7 commands, 3 skills, 1 agent, and 2 hooks (`SessionStart`, `SessionEnd`). Then, inside Claude Code:
 
 ```text
 /grok-build:check
 ```
 
-Ready means Node is available, `grok` is available, and `grok models` both succeeded **and** did not deny the session. If `grok` is not on `PATH`:
+Ready means Node is available, `grok` is available, and `grok models` both succeeded **and** did not deny the session. A first check always reports `update: unknown` and then `This is not an all-clear.`; that is the update cache, and `Status: ready` above it is the answer. If `check` reports the CLI missing, install it from https://docs.x.ai/build/overview and set `GROK_BINARY` if it is not on `PATH`:
 
 ```powershell
 $env:GROK_BINARY = "C:\path\to\grok.exe"
@@ -218,7 +213,7 @@ That is a deliberate gap: how much of your work leaves your machine, and how muc
 
 So there are two ways to run this, and both are legitimate end states.
 
-**Manual only.** Type a slash command when you want Grok, and nothing reaches it otherwise. No configuration, no standing instruction, no surprises on your bill. If that is all you ever want, you are already finished — the rest of this section is optional.
+**Manual only.** Slash commands are opt-in: type one when you want Grok. They do not fire on their own. The shipped `grok-delegate` agent can still be selected when Claude judges the main thread stuck, and that run spends. If you want none of that, put one line in `CLAUDE.md` telling Claude never to select it unless you ask. If slash commands plus that one constraint are all you want, you are finished — the rest of this section is optional.
 
 **Or tell Claude Code when to reach for it.** A few lines in your `CLAUDE.md` turn "I could delegate this" into something that happens without you asking each time: send long documents to Grok instead of your context, always use it for 𝕏, get a second opinion before you commit. You decide which of those, and how far it goes.
 
@@ -228,56 +223,21 @@ So there are two ways to run this, and both are legitimate end states.
 
 ## FAQ
 
-**Does my code leave my machine?**
-Yes. Every task is handed to the real `grok` binary, which sends it to the Grok service —
-prompts, file contents the agent reads, and its output. Nothing in this plugin changes that
-and no local setting prevents it. Separately, the CLI has a telemetry and trace-upload
-channel of its own that this plugin does not touch;
-[SECURITY.md](SECURITY.md) lists the switches, verified against the installed binary.
+**Does my code leave my machine?** Yes. Every task is handed to the real `grok` binary, which sends it to the Grok service — prompts, file contents the agent reads, and its output. Nothing in this plugin changes that and no local setting prevents it. Separately, the CLI has a telemetry and trace-upload channel of its own that this plugin does not touch; [SECURITY.md](SECURITY.md) lists the switches, verified against the installed binary.
 
-**Do I have to uninstall xAI's official plugin first?**
-No. This registers under a different marketplace id (`claude-code-grok-bridge`, not
-`xai-grok-build`) precisely so the two can sit side by side. Installing both under the same
-id fails in a confusing way, which is why the ids differ.
+**Do I have to uninstall xAI's official plugin first?** No. This registers under a different marketplace id (`claude-code-grok-bridge`, not `xai-grok-build`) precisely so the two can sit side by side. Installing both under the same id fails in a confusing way, which is why the ids differ.
 
-**Which Grok plan do I need?**
-Whatever makes `grok` work for you interactively will work here — the bridge does not handle
-billing or authentication at all, it launches the CLI and reports what the CLI reports. Which
-plans and credit arrangements exist is xAI's to define and change, so check their current
-terms rather than a list written here. What is worth knowing on this side: every run costs
-something, the bridge cannot see your remaining balance, and the local ledger is therefore
-the only spend record you get.
+**Which Grok plan do I need?** Whatever makes `grok` work for you interactively will work here — the bridge does not handle billing or authentication at all, it launches the CLI and reports what the CLI reports. Which plans and credit arrangements exist is xAI's to define and change, so check their current terms rather than a list written here. What is worth knowing on this side: every run costs something, the bridge cannot see your remaining balance, and the local ledger is therefore the only spend record you get.
 
-**I installed it and Claude Code never uses it. Is it broken?**
-No, that gap is deliberate. Installing a plugin makes commands available; it does not teach
-the model when to reach for them. See
-[Making Claude Code actually use it](#making-claude-code-actually-use-it) — a few lines in
-your `CLAUDE.md` is the whole fix.
+**I installed it and Claude Code never uses it. Is it broken?** No, that gap is deliberate. Installing a plugin makes commands available; it does not teach the model when to reach for them. See [Making Claude Code actually use it](#making-claude-code-actually-use-it) — a few lines in your `CLAUDE.md` is the whole fix.
 
-**Is it safe to point at a repository I did not write?**
-Read-only is the default and is enforced by removing the writing tools, so the agent cannot
-change your files. But read-only protects *integrity*, not *confidentiality*: the reading
-tools and web search are still there, so hostile text in a repository can influence what the
-model does with what it read. `SECURITY.md` says exactly what each mode does and does not
-protect. Do not pass `--write` on a repository you do not trust.
+**Is it safe to point at a repository I did not write?** Read-only is the default and is enforced by removing the writing tools, so the agent cannot change your files. But read-only protects *integrity*, not *confidentiality*: the reading tools and web search are still there, so hostile text in a repository can influence what the model does with what it read. `SECURITY.md` says exactly what each mode does and does not protect. Do not pass `--write` on a repository you do not trust.
 
-**Does it work on macOS?**
-The unit suite runs there in CI, including tests that spawn and kill real processes. The
-end-to-end suite against the real `grok` CLI has never run on macOS, for want of the
-hardware. So the code is exercised and the product is not proven — expect it to work, do not
-expect it to be verified, and a bug report from a Mac is genuinely useful.
+**Does it work on macOS?** The unit suite runs there in CI, including tests that spawn and kill real processes. The end-to-end suite against the real `grok` CLI has never run on macOS, for want of the hardware. So the code is exercised and the product is not proven — expect it to work, do not expect it to be verified, and a bug report from a Mac is genuinely useful.
 
-**What happens when the Grok allowance runs out mid-run?**
-The run fails with `failureCode: quota-exhausted`, and the surfaces you actually read say so
-in words: the output opens by naming the refusal, and `runs` and `show` summarise it the same
-way, instead of leading with the CLI's error envelope. The tokens the run had already spent
-before the refusal are still booked to the ledger — a refused run is not a free one. Whether
-retrying helps depends on the account: an allowance has to reset, credit can be topped up.
+**What happens when the Grok allowance runs out mid-run?** The run fails with `failureCode: quota-exhausted`, and the surfaces you actually read say so in words: the output opens by naming the refusal, and `runs` and `show` summarise it the same way, instead of leading with the CLI's error envelope. The tokens the run had already spent before the refusal are still booked to the ledger — a refused run is not a free one. Whether retrying helps depends on the account: an allowance has to reset, credit can be topped up.
 
-**Why is the history a single commit?**
-The fork's development history was condensed for publication. The upstream baseline is named
-in `NOTICE` and resolves in xAI's repository, so the exact set of changes is derivable by
-diffing this tree against it — and `CHANGELOG.md` says what changed and why.
+**Why is the history a single commit?** The fork's development history was condensed for publication. The upstream baseline is named in `NOTICE` and resolves in xAI's repository, so the exact set of changes is derivable by diffing this tree against it — and `CHANGELOG.md` says what changed and why.
 
 ## Commands
 
@@ -286,6 +246,14 @@ Slash-command behaviour details live in `plugins/grok-build/commands/*.md`. This
 ### `/grok-build:check`
 
 Probe Node + Grok CLI availability and authentication. Also reaps orphaned runs whose tracked processes are gone.
+
+Two optional flags, both off by default because both cost something: `--verify-tools` asks the CLI whether it still recognises every id in the read-only removal list (it has to start a real session), and `--fetch-update` asks GitHub for the latest release now rather than reporting the cached answer.
+
+**Update notification.** From 0.3.3 onward the plugin tells you when a newer release exists. The SessionEnd hook asks GitHub's public releases endpoint and caches the answer — at most once every six hours after a success, and on a one-hour-doubling-to-one-day backoff after a failure; the next session start prints one line if you are behind. It never downloads or installs anything, and — the part that matters — **if the check failed or has never run, it says nothing rather than telling you that you are up to date.** `check` reports the same state in a `Version:` line that is never omitted, `unknown` included.
+
+Turn it off with `GROK_CC_UPDATE_CHECK=0`. What is sent, when, and what is done with the answer is documented in [SECURITY.md](SECURITY.md) — it is the only outbound request this plugin makes on its own.
+
+⚠ This cannot reach anyone already on 0.3.0, 0.3.1 or 0.3.2, because the notifier ships *inside* a later version. That is precisely the population it exists for, and the gap is unavoidable — which is the argument for shipping it now rather than deferring it a third time.
 
 ### `/grok-build:review`
 
@@ -304,14 +272,14 @@ The bridge launches roughly:
 
 ```bash
 grok --prompt-file <file> --agent explore --no-plan --sandbox read-only \
-  --disallowed-tools run_terminal_cmd,search_replace,search_tool,use_tool \
+  --disallowed-tools run_terminal_cmd,search_replace,search_tool,use_tool,write,monitor,image_gen,image_edit,image_to_video,reference_to_video,web_fetch,scheduler_create,scheduler_delete,scheduler_list \
   --deny Bash --deny Write --deny Edit --deny MCPTool \
   --cwd <ws> --output-format json
 ```
 
-That is the real barrier: `--no-plan` (avoids interactive plan approval, which dead-ends headless), tool removal, deny rules, and sandbox where the OS enforces it. Do not call this "plan mode". On Windows the sandbox is not kernel-enforced, so tool removal and deny rules are the binding half of the barrier.
+That is the real barrier: `--no-plan` (avoids interactive plan approval, which dead-ends headless), tool removal, deny rules, and sandbox where the OS enforces it. Do not call this "plan mode". On Windows the sandbox is not kernel-enforced — measured, not inferred: a direct run with the flag set wrote the file anyway — so tool removal and deny rules are the whole barrier there. Both of those layers hold on Windows; neither is "the binding half" at the other's expense.
 
-Optional flags: `--model`, `--effort` (`low`|`medium`|`high`), `--timeout-ms <ms>`, `--max-turns <n>`, `--base <ref>`, `--scope auto|working-tree|branch`, `--wait` / `--background`, `--json`. If model/effort are omitted, Grok chooses defaults. Trailing words after flags are optional focus text (joined into the review prompt). Staged-only / unstaged-only scopes are not supported.
+Optional flags: `--model`, `--effort` (`low`|`medium`|`high`|`xhigh`), `--timeout-ms <ms>`, `--max-turns <n>`, `--base <ref>`, `--scope auto|working-tree|branch`, `--wait` / `--background`, `--json`. If model/effort are omitted, Grok chooses defaults. Trailing words after flags are optional focus text (joined into the review prompt). Staged-only / unstaged-only scopes are not supported.
 
 Review applies the same deliverable gate as other bridge paths: empty stdout on CLI exit 0 fails with exit `2` and `failureCode: no-deliverable`. See [Exit codes and failure classes](#exit-codes-and-failure-classes).
 
@@ -332,7 +300,7 @@ The bridge launches roughly:
 
 ```bash
 grok --prompt-file <file> --agent explore --no-plan --sandbox read-only \
-  --disallowed-tools run_terminal_cmd,search_replace,search_tool,use_tool \
+  --disallowed-tools run_terminal_cmd,search_replace,search_tool,use_tool,write,monitor,image_gen,image_edit,image_to_video,reference_to_video,web_fetch,scheduler_create,scheduler_delete,scheduler_list \
   --deny Bash --deny Write --deny Edit --deny MCPTool \
   --cwd <ws> --output-format json --json-schema <review-schema>
 ```
@@ -360,10 +328,10 @@ Write policy layering:
 
 | Layer | Default |
 | --- | --- |
-| Bridge `run` CLI | **Read-only** unless you pass `--write`. Enforced by removing the writing tools (`--disallowed-tools run_terminal_cmd,search_replace,search_tool,use_tool`) plus `--deny` rules for `Bash`/`Write`/`Edit`/`MCPTool`, with `--sandbox read-only` on top for kernel enforcement where the OS supports it. Plan mode is **not** used: its "present plan, await approval" fork dead-ends in headless mode. |
+| Bridge `run` CLI | **Read-only** unless you pass `--write`. Enforced by removing fourteen tools via `--disallowed-tools` — shell, editor, both MCP meta-tools, `write`, `monitor`, the media generators, `web_fetch` and all three scheduler tools — plus `--deny` rules for `Bash`/`Write`/`Edit`/`MCPTool`, with `--sandbox read-only` on top for kernel enforcement where the OS supports it. Plan mode is **not** used: its "present plan, await approval" fork dead-ends in headless mode. |
 | Delegate agent / skill | Read-only as well; `--write` is added only for explicit implementation requests |
 
-Note on `--sandbox`: the CLI enforces it via Landlock (Linux) / Seatbelt (macOS) and continues without enforcement elsewhere, so on Windows it is not a barrier by itself — hence the tool removal and deny rules above.
+Note on `--sandbox`: xAI documents enforcement through Landlock and Seatbelt, and the CLI continues without enforcement — and without saying so — wherever neither is available. That is **not** a question of which platform you are on. Landlock is a kernel configuration option: measured 2026-08-09 on Raspberry Pi OS (`6.12.96+rpt-rpi-2712`), it is compiled out, so an ordinary Linux host can be in exactly the position Windows is. Treat `--sandbox` as an extra layer where the kernel happens to provide one, never as the barrier — hence the tool removal and deny rules above, which hold everywhere.
 
 - Direct `node …/grok-bridge.mjs run "…"` is therefore read-only unless `--write` is passed.
 - `--thread <name>` continues a named conversation for this workspace (registry per workspace, one run at a time per name). Without `--fresh`, an existing registration is resumed; with `--fresh`, that name starts a new Grok session and is re-registered only if the run delivers output. Names must be 1–64 characters: letters, digits, `.`, `-`, or `_`, starting alphanumeric. Reserved names `__proto__`, `constructor`, and `prototype` are rejected.
@@ -374,21 +342,9 @@ Note on `--sandbox`: the CLI enforces it via Landlock (Linux) / Seatbelt (macOS)
 - Prefer bridge `--background` for long work so runs record both `bridgePid` (Node worker) and `agentPid` (grok child). Claude Code background is only for short enqueue of that bridge call.
 - For `review` / `critique`, if both `--background` and `--wait` are present, **`--wait` wins** (foreground). `run` accepts `--background` only (no `--wait` flag on the bridge `run` command).
 - `/grok-build:stop` terminates **both** process trees when present (agent then bridge/worker).
-- If you do not pass `--model` or `--effort`, Grok chooses its own defaults.
+- If you do not pass `--model` or `--effort`, Grok chooses its own defaults. `--effort` takes `low`, `medium`, `high` or `xhigh`, and anything else is refused here before the CLI starts. ⚠ Those four are **measured, not copied**: the CLI's binary contains three further names (`none`, `minimal`, `max`) that look like part of the same set and are refused by the flag, and `grok --help` documents no values at all — so the only authoritative statement of the set is the CLI's own rejection, which you get by asking for a level that does not exist. Checked that way against CLI 1.0.5 and CLI 1.0.0, which answer identically. If a future CLI gains a level, this list has to be updated by hand and nothing here will notice on its own; that is a known gap rather than an oversight.
 - Exit codes and `failureCode` for `run` / review / critique: see [Exit codes and failure classes](#exit-codes-and-failure-classes).
 - Concurrency and the write barrier: see [Concurrency and write barrier](#concurrency-and-write-barrier).
-
-### `/grok-build:import`
-
-Import the current Claude transcript into Grok:
-
-```text
-/grok-build:import
-/grok-build:import --source ~/.claude/projects/.../session.jsonl
-/grok-build:import --thread imported-main
-```
-
-Uses `grok import` and prints a resume hint: `grok -r <id>`. Optional `--thread <name>` registers the imported Grok session id under that name for later `run --thread`.
 
 ### `/grok-build:runs`
 
@@ -430,9 +386,22 @@ Show stored output for a finished run:
 /grok-build:show <run-id>
 /grok-build:show <run-id> --wait
 /grok-build:show <run-id> --wait --timeout-ms 120000
+/grok-build:show <run-id> --strands
 ```
 
 Without a run id, shows the latest finished run for the **current Claude session**. With an explicit id, any workspace run may be selected (id lookup is not session-filtered). Process exit reflects the stored run status (`0` completed success, non-zero failed/cancelled). `--wait` requires a run id; wait timeout exits **3** and prints status instead of the result.
+
+**When Grok fans out to its own subagents, `show` reports each strand** — type, status, output size, tool calls — and warns when any of them produced nothing:
+
+```text
+Subagents: 6 (2 completed, 4 failed)
+  ! [general-purpose] Adversarial audit probes — no output, 0 tools
+  + [explore] Read-only explore attempt — 5204 chars, 7 tools
+  + [deep-reasoner] Deep reason parser holes — 8008 chars, 50 tools
+⚠ 4 of 6 strands produced nothing — this answer rests on 2.
+```
+
+That warning is the point. A half-dead fan-out costs exactly what a healthy one costs and returns an answer that reads just as confidently, so without this the difference was invisible. `--strands` prints each strand's full deliverable instead of the summary; either way the originals stay where the Grok CLI wrote them, under its own session directory.
 
 ### `/grok-build:stop`
 
@@ -464,7 +433,7 @@ Process exit alone is overloaded. Prefer `failureCode` in `--json` payloads when
 
 Notes:
 
-- "Applies to" names the commands that talk to Grok. `import`, `check`, `runs`, `show`, `stop`, `threads`, `clean` and `usage` never produce a `failureCode`: they read local state or a local transcript, so there is no CLI run to fail. Two rows said "all" and meant these three.
+- "Applies to" names the commands that talk to Grok. `check`, `runs`, `show`, `stop`, `threads`, `clean` and `usage` never produce a `failureCode`, because none of them launches an *agent* — there is no delegated run whose outcome could be classified. ⚠ That is not the same as "no CLI run": `check` does invoke `grok version` and `grok models` to probe the binary and the session, so it is not a purely local command. Whether those probes draw on your Grok allowance is xAI's to say and is not measured here. Two rows said "all" and meant these three.
 - Automatic nudge (one retry into the same session) runs **only on read-only `run`** when the first attempt exits 0 with empty output. It never runs for `--write`, and it is not used on review/critique.
 - Review uses `--output-format json` and gates on non-empty final text, taking the envelope's text where there is one and raw stdout where there is not. It used to pass `plain`; that produced no envelope, so no usage figure, so every successful review was missing from the spend ledger entirely. Critique uses `--output-format json` plus the review JSON schema and gates on parse + review shape (`verdict`, `summary`, `findings`, `next_steps`).
 - Cancelled runs never report process success (exit 0).
@@ -476,32 +445,32 @@ Notes:
 
 **Per-thread lock.** Two `run --thread <name>` invocations for the same name cannot interleave turns in one Grok session. The second run fails immediately with a clear error until the first finishes or is stopped.
 
-**Write barrier (read-only runs).** Enforcement order: (1) `--disallowed-tools` removes `run_terminal_cmd`, `search_replace`, `search_tool` and `use_tool` from the toolset (the binding half on Windows); (2) `--deny` rules reject `Bash` / `Write` / `Edit` / `MCPTool` if a tool reappears; (3) `--sandbox read-only` adds kernel enforcement on Linux/macOS only. Plan mode is never the barrier.
+**Write barrier (read-only runs).** Enforcement order: (1) `--disallowed-tools` removes fourteen tools from the toolset — the shell, the file editor, the two MCP meta-tools, `write`, `monitor`, the four media generators, `web_fetch` and all three scheduler tools; (2) `--deny` rules reject `Bash` / `Write` / `Edit` / `MCPTool` if a tool reappears; (3) `--sandbox read-only` adds kernel enforcement **only where the OS actually provides a mechanism** — Seatbelt on macOS, Landlock on Linux *if that kernel has it*, which mainstream images such as Raspberry Pi OS do not. Where it is missing the flag is accepted, a write can land, and the CLI says nothing; **every run, review and critique reports which of those applies on your machine** — in the `confinement` block of its `--json` payload, and in the printed result — rather than inferring it from the platform name. ⚠ `check` does **not** report it: this sentence named `check` until 2026-08-20 and was wrong, because the descriptor is attached where a run is launched and `check` launches none. **Layers 1 and 2 hold everywhere, Windows included** — the ordering above is how much each is trusted, not which platforms each survives. Plan mode is never the barrier. The exact list is `READ_ONLY_DISALLOWED_TOOLS` in `grok-bridge.mjs`. Those ids were checked against `grok 1.0.0` on 2026-08-08; re-check with `check --verify-tools` after a CLI upgrade, because an id the CLI does not recognise is silently inert. `scheduler_list` is in the list for a second reason: the CLI's tools declare requirements on each other, and removing `scheduler_create` while `scheduler_list` survives stops the session from starting at all. An id can be real and still be fatal to remove alone — `check --verify-tools` asks the binary which ids it still recognises, and the acceptance suite starts a real session with the whole list.
 
 ## Bridge CLI surface (reference)
 
 Direct invocations of `node …/grok-bridge.mjs` (slash commands shell these):
 
 ```text
-check    [--json]
-review   [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]
-         [--model <model>] [--effort <low|medium|high>]
-         [--timeout-ms <ms>] [--max-turns <n>] [focus ...]
-critique [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]
-         [--model <model>] [--effort <low|medium|high>]
-         [--timeout-ms <ms>] [--max-turns <n>] [focus ...]
+check    [--verify-tools] [--fetch-update] [--json]
+review   [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]
+         [--model <model>] [--effort <low|medium|high|xhigh>]
+         [--timeout-ms <ms>] [--max-turns <n>] [focus text]
+critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]
+         [--model <model>] [--effort <low|medium|high|xhigh>]
+         [--timeout-ms <ms>] [--max-turns <n>] [focus text]
+usage    [--days <n>] [--include-test-workspaces] [--json]
 run      [--background] [--write] [--thread <name>] [--json-schema <json>]
-         [--cwd <path>] [--prompt-file <path>] [--prompts-file <path>]
+         [--prompt-file <path>] [--prompts-file <path>]
          [--resume-last|--resume|--fresh (default)]
-         [--model <model>] [--effort <low|medium|high>]
+         [--model <model>] [--effort <low|medium|high|xhigh>]
          [--timeout-ms <ms>] [--max-turns <n>] [prompt]
-import   [--source <claude-jsonl>] [--thread <name>] [--json]
 runs     [run-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>]
          [--all] [--all-sessions] [--json]
-show     [run-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]
+show     [run-id] [--wait] [--strands] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]
 stop     [run-id] [--json]
 threads  [--forget <name>] [--json]
-clean    --keep <n> and/or --older-than-ms <ms> [--json]
+clean    [--keep <n>] [--older-than-ms <ms>] [--json]
 ```
 
 Flag notes:
@@ -526,65 +495,31 @@ Flag notes:
 
 ## Knowing what the runs cost
 
-`usage` aggregates what the Grok CLI reported for each run across every workspace under
-the state root, with a per-day table. Spend is summed from `total_cost_usd_ticks`, the
-CLI's exact integer form (1 USD = 10^10 ticks) — its own documentation notes that these
-reconcile with the server's usage export while the dollar floats cannot. Records written
-before ticks were captured fall back to the float. A run the CLI marks
-`usage_is_incomplete` is reported separately rather than counted as free, because an
-unaccounted run is unmeasured, not cheap. Runs
-against the test fixture are excluded. Only runs recorded after this feature landed carry
-a cost; older records show tokens only.
+`usage` aggregates what the Grok CLI reported for each run across every workspace under the state root, with a per-day table. Spend is summed from `total_cost_usd_ticks`, the CLI's exact integer form (1 USD = 10^10 ticks) — its own documentation notes that these reconcile with the server's usage export while the dollar floats cannot. Records written before ticks were captured fall back to the float. A run the CLI marks `usage_is_incomplete` is reported separately rather than counted as free, because an unaccounted run is unmeasured, not cheap. Runs against the test fixture are excluded. Only runs recorded after this feature landed carry a cost; older records show tokens only.
 
-It also prints the subscription's weekly usage percentage when it can find one. There is
-**no supported endpoint** for that number: the official CLI fetches its own billing config
-at session start and logs it, and this reads that local log back. Treat it as a hint, not
-a contract — the field names are not public, the log rotates, and the value is only as
-fresh as the last CLI session. Every failure path returns nothing at all rather than a
-wrong number, and it never gates a run: a stale reading must not be able to stop work.
+It also prints the subscription's weekly usage percentage when it can find one. There is **no supported endpoint** for that number: the official CLI fetches its own billing config at session start and logs it, and this reads that local log back. Treat it as a hint, not a contract — the field names are not public, the log rotates, and the value is only as fresh as the last CLI session. Every failure path returns nothing at all rather than a wrong number, and it never gates a run: a stale reading must not be able to stop work.
 
 ### Turning dollars into percent, and keeping it true
 
-The ledger measures **spend**. The subscription page shows a **percentage**. Nothing
-connects the two, because no endpoint publishes the allowance behind the percentage — so
-the exchange rate has to be measured, and re-measured.
+The ledger measures **spend**. The subscription page shows a **percentage**. Nothing connects the two, because no endpoint publishes the allowance behind the percentage — so the exchange rate has to be measured, and re-measured.
 
-The measuring instrument is already in the room. You are running this plugin from a Claude
-Code session; that session can read `usage`, and you can read the subscription page. So
-hand it over occasionally, in one line:
+The measuring instrument is already in the room. You are running this plugin from a Claude Code session; that session can read `usage`, and you can read the subscription page. So hand it over occasionally, in one line:
 
 ```text
 Subscription page says 68% used. Take a calibration point.
 ```
 
-The session reads `usage`, divides spend by percent, appends the point to a file, and tells
-you whether the ratio moved. That is the whole method. It costs nothing, it needs no API,
-and it happens inside work you were doing anyway — which is the only reason it actually
-gets done.
+The session reads `usage`, divides spend by percent, appends the point to a file, and tells you whether the ratio moved. That is the whole method. It costs nothing, it needs no API, and it happens inside work you were doing anyway — which is the only reason it actually gets done.
 
-**Do it repeatedly, not once.** A provider can change what a percentage point is worth
-whenever it likes: a different allowance, a different weighting of input against output
-against cache reads, a new plan tier. A ratio measured in July is a statement about July.
-A series that stays flat across many points is evidence; a single number is an anecdote,
-and it will keep looking correct long after it stopped being so.
+**Do it repeatedly, not once.** A provider can change what a percentage point is worth whenever it likes: a different allowance, a different weighting of input against output against cache reads, a new plan tier. A ratio measured in July is a statement about July. A series that stays flat across many points is evidence; a single number is an anecdote, and it will keep looking correct long after it stopped being so.
 
 Three things make a point worth recording, all learned by getting them wrong:
 
-- **Read it when nothing is running.** An in-flight run has spent money the ledger has not
-  seen yet, and the point silently lands low.
-- **Use the cumulative quotient, not the step.** Percentages are shown as integers, so a
-  single step from 66 to 68 can be anything from just over one point to nearly three. Step
-  deltas scatter wildly while the running total converges — the convergence is the signal.
-- **Sum every state root.** Runs started outside Claude Code land in the temp fallback, and
-  a renamed marketplace creates a new plugin data directory. Reading one root and calling
-  it the total is the easiest way to under-measure by a wide margin.
+- **Read it when nothing is running.** An in-flight run has spent money the ledger has not seen yet, and the point silently lands low.
+- **Use the cumulative quotient, not the step.** Percentages are shown as integers, so a single step from 66 to 68 can be anything from just over one point to nearly three. Step deltas scatter wildly while the running total converges — the convergence is the signal.
+- **Sum every state root.** Runs started outside Claude Code land in the temp fallback, and a renamed marketplace creates a new plugin data directory. Reading one root and calling it the total is the easiest way to under-measure by a wide margin.
 
-⚠ **The result is a lower bound, and knowingly so.** The ledger reads per-run job files, so
-anything it never recorded is invisible: runs whose accounting the CLI marked incomplete
-(reported separately), and runs on another machine drawing the same subscription. Retention
-also prunes old job files at `MAX_JOBS`, so a long enough window silently loses its own
-early history — that one is still open. Treat the figure as "at least this much" and expect
-the true rate to sit above it.
+⚠ **The result is a lower bound, and knowingly so.** The ledger reads per-run job files, so anything it never recorded is invisible: runs whose accounting the CLI marked incomplete (reported separately), and runs on another machine drawing the same subscription. Retention also prunes old job files at `MAX_JOBS`, so a long enough window silently loses its own early history — that one is still open. Treat the figure as "at least this much" and expect the true rate to sit above it.
 
 ## Environment
 
@@ -594,8 +529,8 @@ the true rate to sit above it.
 | `GROK_CC_MAX_CONCURRENCY` | Machine-wide Grok agent cap. Default `max(8, 2 × logical CPUs)`. Set `0` to disable the semaphore. |
 | `GROK_CC_SLOT_WAIT_MS` | How long to wait for a free slot before starting anyway (default `90000`). |
 | `GROK_CC_STDOUT_CAP_BYTES` | Max captured agent stdout (default 32 MiB). Truncation fails the run with `output-truncated`. |
+| `GROK_CC_UPDATE_CHECK` | Set `0` to stop the SessionEnd update check reaching GitHub. ⚠ `check --fetch-update` asks anyway — the variable stops the plugin acting on its own, not you asking explicitly. |
 | `GROK_CC_SESSION_ID` | Claude session id (set by SessionStart hook) |
-| `GROK_CC_TRANSCRIPT_PATH` | Claude transcript path (set by SessionStart hook) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin install root (host) |
 | `CLAUDE_PLUGIN_DATA` | Plugin data root; state lives under `.../state`. Different values → independent concurrency pools. |
 | `CLAUDE_ENV_FILE` | Host env file for session hooks |
@@ -607,7 +542,7 @@ State fallback when `CLAUDE_PLUGIN_DATA` is unset: `$TMPDIR/grok-cc-runs-<userna
 
 ### Session lifecycle
 
-- **SessionStart** writes `GROK_CC_SESSION_ID`, `GROK_CC_TRANSCRIPT_PATH`, and `CLAUDE_PLUGIN_DATA` into the host env file so later bridge calls share session identity.
+- **SessionStart** writes `GROK_CC_SESSION_ID` and `CLAUDE_PLUGIN_DATA` into the host env file so later bridge calls share session identity.
 - **SessionEnd** cancels every **active** job recorded for that Claude session (including jobs started with `--cwd` in other workspaces during the session): marks them `cancelled` ("Stopped by session end.") and terminates their tracked process trees (`agentPid` / `bridgePid` / legacy pids). It does **not** rewrite or prune the job list — finished and cancelled records stay on disk so `/grok-build:show` and `--all-sessions` still work. Retention is the normal **MAX_JOBS (50)** prune on state writes, plus optional bridge `clean`. Background work does not keep running after the Claude session ends; its history does.
 
 ### State layout
@@ -678,24 +613,14 @@ Prefer bridge `--background` so stop can kill both the Node worker and the grok 
 
 ### When the state volume cannot be written
 
-Everything the bridge remembers lives under the plugin data directory. If that volume
-fills up or turns read-only mid-run, the run itself is unaffected — the agent is a
-separate process talking to the network — but nothing about it can be recorded. The
-bridge is built so that this degrades rather than destroys:
+Everything the bridge remembers lives under the plugin data directory. If that volume fills up or turns read-only mid-run, the run itself is unaffected — the agent is a separate process talking to the network — but nothing about it can be recorded. The bridge is built so that this degrades rather than destroys:
 
-- A finished result is still returned to the caller, with `persisted: false` and the
-  reason. You get your answer; only the stored copy is missing.
-- No process is killed on the strength of a decision that could not be recorded. A run
-  whose progress writes are failing looks stale, and reclaiming it is exactly the wrong
-  move, so a failed claim aborts the reclaim.
+- A finished result is still returned to the caller, with `persisted: false` and the reason. You get your answer; only the stored copy is missing.
+- No process is killed on the strength of a decision that could not be recorded. A run whose progress writes are failing looks stale, and reclaiming it is exactly the wrong move, so a failed claim aborts the reclaim.
 - `runs`, `stop` and `show --wait` keep listing what they can instead of failing outright.
 - A corrupt index is rebuilt from the per-job files rather than throwing.
 
-One case cannot be repaired from inside the bridge: if progress writes fail before the
-agent's process id has been recorded **and** the bridge is then hard-killed, nothing on
-disk points at the agent, and it keeps running until it finishes on its own. Recording
-the id needs a writable volume, so there is no fix at that layer — check for stray `grok`
-processes after a crash on a full disk.
+One case cannot be repaired from inside the bridge: if progress writes fail before the agent's process id has been recorded **and** the bridge is then hard-killed, nothing on disk points at the agent, and it keeps running until it finishes on its own. Recording the id needs a writable volume, so there is no fix at that layer — check for stray `grok` processes after a crash on a full disk.
 
 ### Flag matrix (slash → bridge)
 
@@ -715,13 +640,7 @@ npm test
 
 No `npm install` is needed — there are no dependencies.
 
-What a healthy checkout looks like is **`0 fail`, and at most one skip** — which test skips
-is platform-dependent: on Linux and macOS the Windows-only `PATHEXT` resolution test, on
-Windows the symlink test, but only where the host denies symlink creation (no elevation, no
-Developer Mode), so an elevated Windows box skips neither. Those two numbers are the
-invariant; the total only ever grows and is not worth comparing against a number written
-down here. A second skip is a finding: it means a test opted out on your platform, and the
-summary line reports that in the same calm voice as a pass.
+What a healthy checkout looks like is **`0 fail`, and at most one skip** — which test skips is platform-dependent: on Linux and macOS the Windows-only `PATHEXT` resolution test, on Windows the symlink test, but only where the host denies symlink creation (no elevation, no Developer Mode), so an elevated Windows box skips neither. Those two numbers are the invariant; the total only ever grows and is not worth comparing against a number written down here. A second skip is a finding: it means a test opted out on your platform, and the summary line reports that in the same calm voice as a pass.
 
 Tests use Node's built-in test runner and a fake `grok` binary on `PATH`. Runtime code uses Node stdlib only.
 
@@ -729,16 +648,11 @@ Version: the source of truth is `package.json`; `npm run bump-version <x.y.z>` p
 
 ## Contributing
 
-Bug fixes with a reproduction are welcome as a pull request. For anything larger — a feature,
-a new command, a change to how a barrier works — open an issue first and let's agree the
-shape before you write code, so nobody spends an evening on something that gets turned down
-for a reason nobody said out loud. [CONTRIBUTING.md](CONTRIBUTING.md) has the full process,
-including what the test suite expects and how to run the acceptance gates.
+Bug fixes with a reproduction are welcome as a pull request. For anything larger — a feature, a new command, a change to how a barrier works — open an issue first and let's agree the shape before you write code, so nobody spends an evening on something that gets turned down for a reason nobody said out loud. [CONTRIBUTING.md](CONTRIBUTING.md) has the full process, including what the test suite expects and how to run the acceptance gates.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) for the terms and [NOTICE](NOTICE) for the attribution,
-the modification notice and the trademarks.
+Apache-2.0. See [LICENSE](LICENSE) for the terms and [NOTICE](NOTICE) for the attribution, the modification notice and the trademarks.
 
 ---
 
@@ -754,7 +668,4 @@ the modification notice and the trademarks.
 
 Maintained by Kai Wedekind — [@KaiWedekind](https://x.com/KaiWedekind) on 𝕏.
 
-Bugs go in an [issue](../../issues); the template asks for the job record, which is pruned
-after fifty runs in a workspace, so copy it out before it is gone. Security reports go
-through the private channel in [SECURITY.md](SECURITY.md), not a public issue. Anything
-else — a question, or that it was useful — 𝕏 is fine and probably faster.
+Bugs go in an [issue](../../issues); the template asks for the job record, which is pruned after fifty runs in a workspace, so copy it out before it is gone. Security reports go through the private channel in [SECURITY.md](SECURITY.md), not a public issue. Anything else — a question, or that it was useful — 𝕏 is fine and probably faster.

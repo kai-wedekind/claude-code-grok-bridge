@@ -38,7 +38,7 @@ Command selection:
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - Mutual exclusions: `--resume`/`--resume-last` vs `--fresh`; `--thread` vs `--resume-last`.
-- `--effort`: accepted values are `low`, `medium`, `high`.
+- `--effort`: accepted values are `low`, `medium`, `high`, `xhigh`. Anything else is refused by the bridge before the CLI starts.
 - `run --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous delegate run.
 
 Safety rules:

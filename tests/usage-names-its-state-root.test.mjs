@@ -22,6 +22,7 @@
  * spent the money warned about where it was recording while the report that added the money up
  * did not.
  */
+import fs from "node:fs";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -95,4 +96,31 @@ test("stateRootExisted still answers its own separate question", () => {
   assert.equal(report.stateRootExisted, false);
   assert.equal(report.stateRootDisclosure, null);
   assert.match(renderUsage(report), /did not exist before the report ran/);
+});
+
+test("collectUsage never creates the state root it reports as missing", () => {
+  // ⚠ This is why the suite leaked exactly one directory per run for two weeks.
+  //
+  // `writeCachedSubscription` did `mkdirSync(stateRoot, { recursive: true })` before caching
+  // the subscription hint, so a report that had just answered "did not exist before the
+  // report ran" brought that directory into being — falsifying its own finding for every
+  // later run, and creating a path no test-cleanup registry could know about because it is
+  // derived rather than returned by makeTempDir.
+  //
+  // `usage` is a read-only diagnostic. It must leave the filesystem exactly as it found it.
+  const absent = `${makeTempDir()}-definitely-not-created`;
+  assert.equal(fs.existsSync(absent), false, "precondition: the path must not exist");
+
+  const report = collectUsage({
+    stateRoot: absent,
+    env: { CLAUDE_PLUGIN_DATA: "C:\somewhere\plugin-data" },
+    subscriptionOverride: null
+  });
+
+  assert.equal(report.stateRootExisted, false, "the finding itself must still be reported");
+  assert.equal(
+    fs.existsSync(absent),
+    false,
+    "and reporting it must not create it — a diagnostic that changes what it measures is worthless"
+  );
 });

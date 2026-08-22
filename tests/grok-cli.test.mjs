@@ -12,8 +12,7 @@ import {
   getGrokAvailability,
   parseStructuredOutput,
   resolveGrokBinary,
-  runHeadlessAgent,
-  runImport
+  runHeadlessAgent
 } from "../plugins/grok-build/scripts/lib/grok.mjs";
 import { runCommand } from "../plugins/grok-build/scripts/lib/process.mjs";
 
@@ -126,20 +125,11 @@ test("buildHeadlessArgs applies executeTaskRun read-only and write option object
   assert.equal(writeRun.args.includes("--sandbox"), false);
 });
 
-test("runImport parses session id from fake grok json output", () => {
-  const binDir = makeTempDir();
-  installFakeGrok(binDir);
-  const env = buildEnv(binDir);
-  const sourcePath = path.join(makeTempDir(), "sess.jsonl");
-
-  const result = runImport(process.cwd(), {
-    sourcePath,
-    env
-  });
-
-  assert.equal(result.sessionId, "11111111-2222-4333-8444-555555555555");
-  assert.equal(result.resumeCommand, "grok -r 11111111-2222-4333-8444-555555555555");
-});
+// The runImport test that stood here was removed with the command in 0.3.3, and it is worth
+// recording why it passed for as long as it did: tests/fake-grok-fixture.mjs implements
+// `argv[0] === "import"` and hands back a fake session id. So the suite exercised a subcommand
+// the real CLI had already dropped in 0.2.118, and reported it working. A fixture that
+// implements more than the thing it stands in for does not test a contract, it invents one.
 
 test("parseStructuredOutput extracts fenced JSON", () => {
   const raw = 'Here you go:\n```json\n{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}\n```\n';
@@ -190,10 +180,19 @@ test("buildReviewPrompt includes target and focus", () => {
   assert.match(prompt, /Git Status/);
 });
 
-test("live grok --help advertises headless flags when grok is on PATH", () => {
+test("live grok --help advertises headless flags when grok is on PATH", (t) => {
   const help = runCommand("grok", ["--help"], { cwd: process.cwd() });
   if (help.error?.code === "ENOENT" || help.status !== 0) {
-    // Optional smoke only when a real grok binary is available.
+    // ⚠ SAY SO. This used to `return` bare, which node:test records as a plain pass with
+    // zero assertions — so on CI, or on any machine without the CLI, a test named for what
+    // the live binary advertises reported success having asked it nothing. Three sibling
+    // containment tests had the same shape and were converted on 2026-08-16; this one was
+    // outside that order's scope and is the fourth.
+    //
+    // ⚠ Not every early return is this defect. A triage on 2026-08-17 found one where the
+    // return IS the success path, and converting it would have introduced a bug. The test
+    // here is whether the branch means "the property held" or "I could not look".
+    t.skip("no usable `grok` on PATH, so there is no live --help to read; skipping is honest, passing would not be");
     return;
   }
   const text = `${help.stdout}\n${help.stderr}`;

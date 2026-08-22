@@ -1,6 +1,6 @@
 ---
 description: Show the stored final output for a finished Grok Build run in this repository
-argument-hint: '[run-id] [--wait] [--timeout-ms <ms>] [--json]'
+argument-hint: '[run-id] [--wait] [--strands] [--timeout-ms <ms>] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
@@ -12,6 +12,7 @@ Behaviour:
 - With an explicit run id, looks up that id in the workspace (not session-filtered).
 - `--wait` requires a run id and polls until the run is finished or the wait deadline expires (default 240000 ms; override with `--timeout-ms`). Wait timeout exits 3 and prints status rather than a result payload.
 - Process exit reflects the stored run status (0 on successful completion, non-zero on failed/cancelled).
+- When Grok fanned out to its own subagents, a `Subagents:` block lists each strand with its type, status, output size and tool-call count, and warns when any strand produced nothing — a run whose answer rests on two of six strands cost the same as one where all six delivered. `--strands` prints every strand's full deliverable instead of just the summary.
 
 Present the full command output to the user. Do not summarize or condense it. Preserve all details including:
 - Run ID and status

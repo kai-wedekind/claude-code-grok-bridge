@@ -1,6 +1,6 @@
 {
   "name": "grok-build",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Claude Code ↔ Grok Build bridge for review, critique, and delegation.",
   "author": {
     "name": "Kai Wedekind"

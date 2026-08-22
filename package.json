@@ -1,6 +1,6 @@
 {
   "name": "claude-code-grok-bridge",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": true,
   "type": "module",
   "description": "Fork of the Claude Code ↔ Grok Build bridge for review, critique, and delegation.",
@@ -20,6 +20,8 @@
   "scripts": {
     "bump-version": "node scripts/bump-version.mjs",
     "check-version": "node scripts/bump-version.mjs --check",
+    "check-test-count": "node scripts/check-test-count.mjs",
+    "check-tool-list": "node scripts/check-tool-list.mjs",
     "test": "node scripts/run-tests.mjs"
   }
 }

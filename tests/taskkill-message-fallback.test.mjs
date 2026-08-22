@@ -13,7 +13,11 @@
  * process all exit 128. So this branch is a backstop rather than a hot path — but a backstop
  * nobody has ever executed is indistinguishable from one that does not work.
  *
- * These tests drive it directly, with a non-128 status, in both directions.
+ * ⚠ **Rewritten 2026-08-09 for A05, and the assertions CHANGED rather than being extended.**
+ * These tests used to steer the pid to look alive and still expect `gone: true` — they were
+ * encoding the defect. The message branch now confirms against the OS exactly as the
+ * exit-128 branch above it does, so a missing-process message no longer settles the kill
+ * target on its own. When text and OS disagree, the OS wins.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -33,25 +37,51 @@ function taskkillSaying(status, stdout, stderr = "") {
 }
 
 /**
- * Force the identity check out of the way and the pid to look alive.
+ * Liveness answers in order, because one constant cannot express the real sequence.
  *
- * Without `isGoneImpl` the real `process.kill(pid, 0)` runs, and on a POSIX CI runner a made
- * up pid answers ESRCH — the kill path would then never be reached at all and the test would
- * pass for the wrong reason on two of three platforms.
+ * `isGoneImpl` is consulted twice: once before taskkill runs, where "gone" short-circuits
+ * the whole function, and once after, to classify the outcome. The ordinary success path is
+ * therefore alive-then-gone, and a stub returning one fixed value can only ever test half
+ * of it. The last value repeats so a caller cannot fall off the end.
  */
-const ALIVE_AND_UNCHECKED = {
-  platform: "win32",
-  isGoneImpl: () => false,
-  readImageImpl: () => null
-};
+function livenessSequence(...answers) {
+  let index = 0;
+  return () => answers[Math.min(index++, answers.length - 1)];
+}
 
-test("a non-128 exit whose text says the process is missing is still settled as gone", () => {
+const WIN = { platform: "win32", readImageImpl: () => null };
+
+/** Alive on entry, gone once taskkill has run — the normal successful kill. */
+const killedIt = () => ({ ...WIN, isGoneImpl: livenessSequence(false, true) });
+
+/** Alive on entry and STILL alive afterwards, whatever the message claimed. */
+const survivedIt = () => ({ ...WIN, isGoneImpl: livenessSequence(false, false) });
+
+test("a non-128 exit whose text says missing is settled as gone once the OS agrees", () => {
   const outcome = terminateProcessTree(4321, {
-    ...ALIVE_AND_UNCHECKED,
+    ...killedIt(),
     runCommandImpl: taskkillSaying(1, "", 'ERROR: The process "4321" not found.')
   });
 
-  assert.equal(outcome.gone, true, "the message branch must classify this as gone");
+  assert.equal(outcome.gone, true, "message plus a confirming probe must classify as gone");
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.method, "taskkill");
+});
+
+test("A05: a missing-process message does NOT settle the target while the pid is still alive", () => {
+  // The defect this replaces. Text is weaker than it looks: with `/T` the message can name
+  // a descendant the tree walk lost rather than the target, the wording match is
+  // approximate on a localised system, and the pid may have been recycled. Believing it
+  // over the OS takes the unsafe direction — `gone: true` settles the kill target, `stop`
+  // then skips restoring the pids after the terminal claim has nulled them, and a live
+  // agent keeps running and spending under a record that no longer names it.
+  const outcome = terminateProcessTree(4321, {
+    ...survivedIt(),
+    runCommandImpl: taskkillSaying(1, "", 'ERROR: The process "4321" not found.')
+  });
+
+  assert.notEqual(outcome.gone, true, "the OS said alive; the message must not overrule it");
   assert.equal(outcome.attempted, true);
   assert.equal(outcome.delivered, false);
   assert.equal(outcome.method, "taskkill");
@@ -71,7 +101,7 @@ test("each surviving pattern reaches the branch, so none is dead weight", () => 
 
   for (const text of wordings) {
     const outcome = terminateProcessTree(4321, {
-      ...ALIVE_AND_UNCHECKED,
+      ...killedIt(),
       runCommandImpl: taskkillSaying(1, "", text)
     });
     assert.equal(outcome.gone, true, `not classified as gone: ${text}`);
@@ -84,7 +114,7 @@ test("a non-128 exit with an unrelated failure is NOT silently called gone", () 
   assert.throws(
     () =>
       terminateProcessTree(4321, {
-        ...ALIVE_AND_UNCHECKED,
+        ...survivedIt(),
         runCommandImpl: taskkillSaying(
           1,
           "",
@@ -100,7 +130,7 @@ test("the message is read from stdout as well as stderr", () => {
   // taskkill writes its errors to stderr, but the branch concatenates both streams and the
   // suite only ever exercised one of them.
   const outcome = terminateProcessTree(4321, {
-    ...ALIVE_AND_UNCHECKED,
+    ...killedIt(),
     runCommandImpl: taskkillSaying(1, 'ERROR: The process "4321" not found.', "")
   });
 

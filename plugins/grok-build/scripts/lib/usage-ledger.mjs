@@ -168,7 +168,17 @@ function readCachedSubscription(stateRoot) {
 
 function writeCachedSubscription(stateRoot, reading) {
   try {
-    fs.mkdirSync(stateRoot, { recursive: true });
+    // ⚠ Do NOT create the state root. `usage` is a read-only diagnostic and it reports
+    // `stateRootExisted` — so creating the directory here made the command falsify its own
+    // finding: the first run said "did not exist before the report ran" and brought it into
+    // being, and every run afterwards saw nothing wrong. Caching a hint does not justify
+    // writing to a location the user never set up, and without a state root there is no
+    // ledger for the hint to sit beside anyway. Found 2026-08-09 while chasing the one temp
+    // directory the suite leaked per run: it was this, reached through a derived path that
+    // no cleanup registry could ever have known about.
+    if (!fs.existsSync(stateRoot)) {
+      return;
+    }
     fs.writeFileSync(path.join(stateRoot, SUBSCRIPTION_CACHE_FILE), JSON.stringify(reading), {
       encoding: "utf8",
       mode: 0o600

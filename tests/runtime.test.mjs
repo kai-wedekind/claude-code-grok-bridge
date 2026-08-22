@@ -85,6 +85,27 @@ test("read-only runs carry the write barrier, write runs do not", () => {
   assert.match(readOnlyJoined, /--sandbox read-only/);
   assert.match(readOnlyJoined, /--no-plan/);
 
+  // ⚠ These two assert an ABSENCE, and they belong here rather than in the option→argv unit
+  // test. That test hands `alwaysApprove: false` in itself, so it pins the MAPPING and would
+  // stay green if the bridge's own call site started passing `true`. This one drives the real
+  // command, so it pins the DECISION — `alwaysApprove: write` at the read-only call site.
+  //
+  // Worth the two lines because upstream `92b76a6` edits exactly that expression: the failure
+  // mode is a careless conflict resolution that hands a read-only run blanket approval, and
+  // nothing else in the suite would notice.
+  assert.doesNotMatch(
+    readOnlyJoined,
+    /--always-approve/,
+    "a read-only run must never carry blanket approval"
+  );
+  // Never set on either path (`permissionMode: undefined`); read-only is enforced by tool
+  // removal and deny rules instead, because plan mode dead-ends headless.
+  assert.doesNotMatch(
+    readOnlyJoined,
+    /--permission-mode/,
+    "read-only confinement is tool removal, not plan mode — see the note at the call site"
+  );
+
   fs.writeFileSync(argvLog, "", "utf8");
   const writeRun = run(process.execPath, [SCRIPT, "run", "--write", "--cwd", workspace, "change this"], { env });
   assert.equal(writeRun.status, 0, writeRun.stderr);
@@ -430,11 +451,53 @@ test("critique forwards --model and --effort to grok", () => {
   assert.equal(argv[argv.indexOf("--effort") + 1], "medium");
 });
 
+/**
+ * ⚠ THIS TEST HAS BEEN INVERTED THREE TIMES, AND THAT IS THE POINT OF KEEPING IT.
+ *
+ * It once asserted that `xhigh` must be REJECTED; xAI shipped it with grok-4.6 and the bridge
+ * was refusing the CLI's best setting, so on 2026-08-12 the level moved out of the rejection
+ * set. On 2026-08-21 the allowlist was removed entirely, on the belief — read out of the CLI
+ * binary — that the flag took seven levels while we allowed four. Measured the same day
+ * against a running CLI, the flag takes exactly these four and refuses `max`, `minimal` and
+ * `none` on both testable versions, so the list had been right all along and the list came
+ * back.
+ *
+ * `max` therefore stays in the rejection set, and now for a reason that was checked rather
+ * than inferred.
+ */
 test("review rejects unsupported --effort values", () => {
   const { repo, binDir, pluginDataDir } = setupReviewableRepo();
 
-  for (const effort of ["extreme", "xhigh", "max"]) {
+  // `max`, `minimal` and `none` are the three names the CLI binary lists beside the real ones
+  // and which the flag refuses — the exact trap that produced the wrong removal. `extreme` and
+  // `spectacular` are not levels anywhere.
+  for (const effort of ["extreme", "max", "minimal", "none", "spectacular"]) {
     const result = run("node", [SCRIPT, "review", "--effort", effort], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    assert.notEqual(result.status, 0, `expected rejection for --effort ${effort}`);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Unsupported reasoning effort/i);
+  }
+});
+
+test("review rejects --effort values that could be read as a second option", () => {
+  const { repo, binDir, pluginDataDir } = setupReviewableRepo();
+
+  // ⚠ SEPARATE FROM THE TEST ABOVE ON PURPOSE, even though membership refuses these for free
+  // today. The property is not "this is not a level" but "this must never reach argv":
+  // without it `--effort --write` smuggles a second option into the CLI call, which is the
+  // one way a bad effort value could do damage rather than merely fail. If the check is ever
+  // made permissive again, this is the part that has to be replaced rather than dropped.
+  //
+  // ⚠ `process.execPath`, not "node" — and that is load-bearing rather than tidiness. The
+  // helper only spawns through a shell when the command is not an absolute path, and on
+  // Windows that shell re-splits "high --write" into two arguments before the bridge ever
+  // sees it. The bridge then rejects nothing, exits 0, and the case reads as a defence that
+  // is not there. Caught here on 2026-08-21 by exactly that false failure.
+  for (const effort of ["--write", "high --write", "$(id)", "high;id", "-high", "high!", ".high"]) {
+    const result = run(process.execPath, [SCRIPT, "review", "--effort", effort], {
       cwd: repo,
       env: pluginDataEnv(pluginDataDir, binDir)
     });
@@ -690,32 +753,12 @@ function readStoredJobFromDisk(workspaceRoot, jobId) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
 }
 
-test("import uses grok import and prints resume hint", () => {
-  const home = makeTempDir();
-  const projects = path.join(home, ".claude", "projects", "demo");
-  fs.mkdirSync(projects, { recursive: true });
-  const sessionPath = path.join(projects, "sess-transfer.jsonl");
-  fs.writeFileSync(sessionPath, '{"type":"user","text":"hi"}\n', "utf8");
-
-  const repo = makeTempDir();
-  const binDir = makeTempDir();
-  const pluginDataDir = makeTempDir();
-  installFakeGrok(binDir);
-  initGitRepo(repo);
-
-  const result = run("node", [SCRIPT, "import", "--source", sessionPath, "--json"], {
-    cwd: repo,
-    env: pluginDataEnv(pluginDataDir, binDir, {
-      HOME: home,
-      USERPROFILE: home
-    })
-  });
-
-  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
-  const payload = JSON.parse(result.stdout);
-  assert.equal(payload.threadId, "11111111-2222-4333-8444-555555555555");
-  assert.equal(payload.resumeCommand, "grok -r 11111111-2222-4333-8444-555555555555");
-});
+// The end-to-end `import` test that stood here went with the command in 0.3.3. Its removal is
+// recorded rather than silent because of how it behaved: it drove the full path and passed on
+// every run, while the subcommand it exercised had not existed in the real CLI since 0.2.118.
+// tests/fake-grok-fixture.mjs answers `argv[0] === "import"` with a session id, so the fixture
+// supplied the feature the CLI had dropped. Its replacement lives in done-surfaces.test.mjs and
+// asserts refusal instead of success.
 
 test("run-resume-candidate reports available after a completed run with thread id", () => {
   const repo = makeTempDir();

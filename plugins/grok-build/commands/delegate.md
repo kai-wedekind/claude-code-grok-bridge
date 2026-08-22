@@ -1,15 +1,12 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the Grok Build delegate subagent
-argument-hint: "[--background|--wait] [--write] [--thread <name>] [--json-schema <json>] [--cwd <path>] [--prompt-file <path>] [--prompts-file <path>] [--timeout-ms <ms>] [--max-turns <n>] [--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [what Grok should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--write] [--thread <name>] [--json-schema <json>] [--cwd <path>] [--prompt-file <path>] [--prompts-file <path>] [--timeout-ms <ms>] [--max-turns <n>] [--resume|--fresh] [--model <model>] [--effort <low|medium|high|xhigh>] [what Grok should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
-Invoke the `grok-build:grok-delegate` subagent via the `Agent` tool (`subagent_type: "grok-build:grok-delegate"`), forwarding the raw user request as the prompt.
-`grok-build:grok-delegate` is a subagent, not a skill — do not call `Skill(grok-build:grok-delegate)` (no such skill) or `Skill(grok-build:delegate)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
-The final user-visible response must be Grok's output verbatim.
+Invoke the `grok-build:grok-delegate` subagent via the `Agent` tool (`subagent_type: "grok-build:grok-delegate"`), forwarding the raw user request as the prompt. `grok-build:grok-delegate` is a subagent, not a skill — do not call `Skill(grok-build:grok-delegate)` (no such skill) or `Skill(grok-build:delegate)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it. The final user-visible response must be Grok's output verbatim.
 
-Raw user request:
-$ARGUMENTS
+Raw user request: $ARGUMENTS
 
 Background ownership model (one policy for command, agent, and skill):
 

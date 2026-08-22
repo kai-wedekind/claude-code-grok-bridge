@@ -382,43 +382,37 @@ test("SURFACE-05: clean --keep retains newest terminal jobs only", () => {
   }
 });
 
-test("SURFACE-05: import --thread registers the imported session", () => {
+test("SURFACE-05: the removed import subcommand is rejected, not silently accepted", () => {
+  // `import` was removed in 0.3.3. The Grok CLI has had no such subcommand since 0.2.118 —
+  // the real argv exits 2 with "unexpected argument" — and nothing succeeded it: `sessions`
+  // offers list, search and delete, while `--resume` resumes Grok's own sessions rather than
+  // ingesting a Claude transcript.
+  //
+  // The test that stood here drove the whole command end to end and passed throughout, because
+  // tests/fake-grok-fixture.mjs implements `argv[0] === "import"` and returns a session id. The
+  // fixture implemented more than the thing it stood in for, so the suite kept certifying a
+  // command that could not work against any CLI a user had.
+  //
+  // What replaces it asserts the removal rather than the feature: an unknown subcommand must
+  // be refused with a non-zero exit. Deleting the old test instead would have left nothing to
+  // notice if the dispatch arm came back in a merge.
   const pluginDataDir = makeTempDir();
   const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeGrok(binDir, "import-ok");
-  // Import only accepts transcripts under ~/.claude/projects.
-  const projectsDir = path.join(os.homedir(), ".claude", "projects", `gbp-done-test-${Date.now()}`);
-  fs.mkdirSync(projectsDir, { recursive: true });
-  const transcript = path.join(projectsDir, "session.jsonl");
-  fs.writeFileSync(transcript, "{}\n", "utf8");
-  // Parent must use the same state root as the bridge child, or listNamedThreads
-  // reads a different directory and the registry looks empty.
-  const previous = process.env.CLAUDE_PLUGIN_DATA;
-  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
 
-  try {
-    const result = run(
-      process.execPath,
-      [SCRIPT, "import", "--source", transcript, "--thread", "imported", "--json", "--cwd", workspace],
-      { env: pluginDataEnv(pluginDataDir, binDir) }
-    );
-    assert.equal(result.status, 0, result.stderr);
-    const payload = JSON.parse(result.stdout);
-    assert.equal(payload.threadRegistered, true);
-    assert.equal(payload.thread, "imported");
-    assert.equal(listNamedThreads(workspace).imported.sessionId, payload.threadId);
-  } finally {
-    if (previous === undefined) {
-      delete process.env.CLAUDE_PLUGIN_DATA;
-    } else {
-      process.env.CLAUDE_PLUGIN_DATA = previous;
-    }
-    try {
-      fs.rmSync(projectsDir, { recursive: true, force: true });
-    } catch {
-    }
-  }
+  const result = run(
+    process.execPath,
+    [SCRIPT, "import", "--json", "--cwd", workspace],
+    { env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+
+  assert.notEqual(result.status, 0, "a removed subcommand must not exit 0");
+  assert.match(
+    `${result.stdout}${result.stderr}`,
+    /Unknown subcommand/i,
+    "the failure must name the cause rather than being an empty non-zero"
+  );
 });
 
 test("SURFACE-05: show exits with stored status; --wait timeout is 3", () => {
@@ -534,8 +528,78 @@ test("SURFACE-06: SessionStart writes export and plain KEY=VALUE lines", () => {
   assert.match(body, /export GROK_CC_SESSION_ID='sess-123'/);
   assert.match(body, /^GROK_CC_SESSION_ID=sess-123$/m);
   assert.doesNotMatch(body, /^GROK_CC_SESSION_ID='/m, "the plain line must not be quoted");
-  assert.match(body, /export GROK_CC_TRANSCRIPT_PATH=/);
-  assert.match(body, /^GROK_CC_TRANSCRIPT_PATH=/m);
+  // GROK_CC_TRANSCRIPT_PATH was asserted here until 0.3.3. It is gone: nothing ever read it
+  // after `/grok-build:import` was removed, and every variable costs two lines in a file whose
+  // growth is what broke the Bash tool. Asserting its ABSENCE, so it cannot drift back in.
+  assert.doesNotMatch(body, /GROK_CC_TRANSCRIPT_PATH/, "the dead transcript variable must stay gone");
+
+  // ⚠ ORDER. Both forms are written, a shell runs both, and the LAST assignment wins — so the
+  // unquoted line must come FIRST or it overwrites the escaped one. This is not style: with the
+  // old order a Windows path lost every backslash, measured live in a real session.
+  // Anchored at line starts, not by searching for a leading newline: the bare line is now the
+  // FIRST thing in the block, so at the top of a fresh file it has no newline before it.
+  const plainAt = body.search(/^GROK_CC_SESSION_ID=/m);
+  const exportAt = body.search(/^export GROK_CC_SESSION_ID=/m);
+  assert.ok(plainAt !== -1 && exportAt !== -1, "both forms must be present");
+  assert.ok(
+    plainAt < exportAt,
+    "the bare line must precede the export line, or a shell ends up with the unescaped value"
+  );
+});
+
+test("SURFACE-05b: a backslash path survives the env file through a real shell", (t) => {
+  // The guard that actually matters, and the one the shape assertions above cannot give: run
+  // the file the way the consumer does and compare the VALUE, not the spelling.
+  //
+  // ⚠ WHERE THERE IS NO USABLE SHELL THIS MUST SKIP, AND `return` IS NOT A SKIP. It was one
+  // until 2026-08-09: the comment said "skipped rather than failed" while the body printed a
+  // line and returned — which node:test counts as a PASS. So on a host without bash this
+  // reported success for a round-trip it had never performed, and the green summary said
+  // nothing. Found by a vacuity audit.
+  //
+  // ⚠ And existence is the wrong question, the same trap as `env-file-shell-safety.test.mjs`:
+  // a shell can exist and still be unable to resolve `C:/...`, which is exactly what the WSL
+  // alias does on Windows. Ask it to do the job on a real temp path and check that it did.
+  const probeDir = makeTempDir();
+  const probeFile = path.join(probeDir, "probe-env");
+  fs.writeFileSync(probeFile, "export SHELL_PROBE='canary-42'\n", "utf8");
+  const shell = ["/bin/bash", "/usr/bin/bash", "C:\\Program Files\\Git\\bin\\bash.exe"].find((p) => {
+    if (!fs.existsSync(p)) return false;
+    const probe = run(p, ["-c", `source '${probeFile.replace(/\\/g, "/")}'; printf '[%s]' "$SHELL_PROBE"`]);
+    return (probe.stdout || "").includes("[canary-42]");
+  });
+  if (!shell) {
+    t.skip("no shell here can source a file at a native temp path — value round-trip not exercised");
+    return;
+  }
+
+  const dir = makeTempDir();
+  const envFile = path.join(dir, "env");
+  fs.writeFileSync(envFile, "");
+  const pluginData = "C:\\Users\\test\\AppData\\Local\\Temp\\state";
+
+  const result = run(process.execPath, [HOOK, "SessionStart"], {
+    env: { ...process.env, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: pluginData },
+    input: JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: "sess-456",
+      transcript_path: "C:\\tmp\\t.jsonl"
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const script = path.join(dir, "probe.sh");
+  fs.writeFileSync(
+    script,
+    `. "$1"\nprintf '%s' "$CLAUDE_PLUGIN_DATA"\n`.replace(/\r\n/g, "\n"),
+    "utf8"
+  );
+  const probe = run(shell, [script, envFile]);
+  assert.equal(
+    probe.stdout,
+    pluginData,
+    `a shell sourcing the env file must see the path unchanged; got "${probe.stdout}"`
+  );
 });
 
 test("SURFACE-06: repeated SessionStart does not grow the env file", () => {
@@ -580,7 +644,7 @@ test("SURFACE-06: repeated SessionStart does not grow the env file", () => {
     afterFirst.length,
     `nine identical SessionStart events must not grow the file; grew ${afterFirst.length} -> ${afterMany.length}`
   );
-  for (const name of ["GROK_CC_SESSION_ID", "GROK_CC_TRANSCRIPT_PATH", "CLAUDE_PLUGIN_DATA"]) {
+  for (const name of ["GROK_CC_SESSION_ID", "CLAUDE_PLUGIN_DATA"]) {
     const hits = afterMany.split("\n").filter((l) => l.trim().startsWith(`export ${name}=`));
     assert.equal(hits.length, 1, `${name} must appear exactly once, found ${hits.length}`);
   }
@@ -595,6 +659,66 @@ test("SURFACE-06: repeated SessionStart does not grow the env file", () => {
   assert.ok(
     afterChange.length < 2000,
     `env file must stay small; MSYS2 bash truncates a -c argument past 8186 chars. Got ${afterChange.length}`
+  );
+});
+
+test("SURFACE-06: another hook's lines survive, blank lines included", () => {
+  // ⚠ THIS TEST ASSERTS ON CONTENT WE DO NOT OWN, and that is the entire point.
+  //
+  // The rewrite that fixed unbounded growth dropped every blank line in the file, not just
+  // the empty final element its own split had created. CLAUDE_ENV_FILE is SHARED — any hook
+  // may write to it — so that quietly reformatted other people's content on every
+  // SessionStart, of which there is one per start, resume and compaction.
+  //
+  // It survived review and shipped into a public pull request because every existing
+  // assertion here reads back the variables this hook writes. A test that only inspects what
+  // you own is structurally blind to what you damage, however carefully it is written.
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  const foreign =
+    "# another hook was here\n" +
+    "export OTHER_HOOK_A=1\n" +
+    "\n" +
+    "# the blank line above separates two groups and belongs to whoever wrote it\n" +
+    "export OTHER_HOOK_B=2\n";
+  fs.writeFileSync(envFile, foreign, "utf8");
+  const pluginData = makeTempDir();
+
+  function fire(sessionId) {
+    return run(process.execPath, [HOOK, "SessionStart"], {
+      env: { ...process.env, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: pluginData },
+      input: JSON.stringify({
+        hook_event_name: "SessionStart",
+        session_id: sessionId,
+        transcript_path: "C:\\\\tmp\\\\transcript.jsonl"
+      })
+    });
+  }
+
+  assert.equal(fire("sess-a").status, 0);
+  const after = fs.readFileSync(envFile, "utf8");
+
+  // Every foreign line, in order, byte for byte — including the blank one.
+  for (const line of foreign.split("\n").filter((l) => l !== "")) {
+    assert.ok(after.includes(line), `foreign line was lost: ${JSON.stringify(line)}`);
+  }
+  assert.match(
+    after,
+    /export OTHER_HOOK_A=1\n\n# the blank line above/,
+    "the blank line between the two foreign groups must survive verbatim"
+  );
+
+  // And the growth fix must still hold with foreign content present: repeated events must
+  // not accumulate. Fixing the blank-line damage by reverting to append would trade one
+  // defect for the worse one.
+  const afterFirst = fs.readFileSync(envFile, "utf8");
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal(fire("sess-a").status, 0);
+  }
+  const afterMany = fs.readFileSync(envFile, "utf8");
+  assert.equal(
+    afterMany.length,
+    afterFirst.length,
+    `repeated events must not grow a file containing foreign lines; ${afterFirst.length} -> ${afterMany.length}`
   );
 });
 

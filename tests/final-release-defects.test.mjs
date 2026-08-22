@@ -86,7 +86,7 @@ test("DEFECT-disk: stale live reclaim does not terminate when terminal claim can
   });
 });
 
-test("DEFECT-disk: stale live reclaim terminates only after a successful terminal claim", () => {
+test("DEFECT-disk: stale live reclaim claims the record and deliberately does NOT terminate the pid", () => {
   withPluginData(() => {
     const workspace = makeTempDir();
     const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
@@ -122,11 +122,23 @@ test("DEFECT-disk: stale live reclaim terminates only after a successful termina
 
     assert.equal(reclaimed.status, "failed");
     assert.ok(order.includes("claim"), "must claim terminal");
+    // ⚠ INVERTED 2026-08-11, deliberately, and left here rather than deleted so nobody
+    // restores the kill without reading why. This used to assert "must terminate after a
+    // successful claim" and it was pinning a real earlier decision.
+    //
+    // The pids reaching this branch are alive and fifteen minutes stale, and the only evidence
+    // that they are ours is a basename match through a comparator that returns true whenever it
+    // has no fingerprint to compare. After that long the process we tracked may be gone and its
+    // pid reissued — most likely to ANOTHER agent carrying the identical image. `stop` already
+    // refuses this exact kill and explains why in its own comments; reclaim was the one path
+    // that did not apply that caution. Ending someone else's run mid-write is worse than
+    // leaving an abandoned one running, and the claim below keeps the kill targets on the
+    // record precisely so an explicit `stop` can still finish it.
     assert.ok(
-      order.some((step) => step.startsWith("terminate:")),
-      "must terminate after a successful claim"
+      !order.some((step) => step.startsWith("terminate:")),
+      "a live pid must not be signalled on age plus basename alone"
     );
-    assert.equal(order[0], "claim", "claim must happen before any terminate");
+    assert.equal(order[0], "claim", "the claim must still happen, and still happen first");
     assert.match(reclaimed.errorMessage || "", /abandon|stale|may still be running/i);
     assert.equal(reclaimed.agentPid, agentPid, "kill targets retained on abandon");
     assert.equal(reclaimed.bridgePid, bridgePid);

@@ -234,7 +234,10 @@ const STATE_FILE_MODE = 0o600;
 const RENAME_RETRYABLE_CODES = new Set(["EPERM", "EACCES", "EBUSY", "EEXIST"]);
 const RENAME_MAX_ATTEMPTS = 8;
 
-function writeFileAtomic(filePath, content) {
+// Exported since 0.3.3 for the update-check cache, which needs the same temp+rename discipline
+// as the job records: a half-written cache is a parse error the reader then has to survive, and
+// `writeJsonFile` in lib/fs.mjs is a plain writeFileSync with no such guarantee.
+export function writeFileAtomic(filePath, content) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
   const tempPath = path.join(

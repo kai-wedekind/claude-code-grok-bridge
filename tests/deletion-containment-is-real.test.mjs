@@ -22,7 +22,7 @@ function linkDirectory(target, linkPath) {
   fs.symlinkSync(target, linkPath, process.platform === "win32" ? "junction" : "dir");
 }
 
-test("a symlinked directory component cannot carry a deletion outside the state root", () => {
+test("a symlinked directory component cannot carry a deletion outside the state root", (t) => {
   const base = scratch("containment");
   const stateDir = path.join(base, "stateroot");
   const victimDir = path.join(base, "victim");
@@ -42,6 +42,7 @@ test("a symlinked directory component cannot carry a deletion outside the state 
     // Some CI images refuse symlink creation outright. Skipping is honest; passing on a
     // machine that could not build the attack would not be.
     if (error?.code === "EPERM" || error?.code === "EACCES") {
+      t.skip("could not create the directory junction that is the attack; without it this test would certify nothing");
       return;
     }
     throw error;

@@ -71,9 +71,20 @@ test("DEFECT1-abandon: stale live PID is reclaimed with kill targets retained", 
     });
 
     assert.equal(reclaimed.status, "failed", "stale live record must leave active list");
-    assert.ok(
-      terminated.includes(agentPid) || terminated.includes(bridgePid),
-      "must best-effort terminate tracked processes while reclaiming"
+    // ⚠ INVERTED 2026-08-11. This asserted "must best-effort terminate tracked processes while
+    // reclaiming". The rest of this test is unchanged and still load-bearing: the record must
+    // leave the active list, must say abandoned-while-alive rather than gone, and must KEEP its
+    // kill targets. Only the automatic signal is withdrawn.
+    //
+    // A pid that is alive fifteen minutes after the record went stale cannot be distinguished
+    // from a recycled one by image basename, and on a machine running several agents the
+    // recycled pid is most likely another agent with the same image. `stop` refuses this kill
+    // for that stated reason; reclaim now agrees with it. The retained targets below are what
+    // makes that safe — the run is still stoppable, by someone who decided to stop it.
+    assert.deepEqual(
+      terminated,
+      [],
+      "a live pid must not be signalled on age plus basename alone — it may belong to another agent"
     );
     // Distinct from the genuine-orphan wording ("no longer running").
     assert.match(

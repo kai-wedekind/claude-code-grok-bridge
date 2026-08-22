@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
-import { makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import {
   describeStateRootOrigin,
   listNamedThreads,
@@ -20,8 +20,10 @@ import { collectUsage } from "../plugins/grok-build/scripts/lib/usage-ledger.mjs
 import { renderJobStatusReport } from "../plugins/grok-build/scripts/lib/render.mjs";
 import {
   describeConfinement,
+  interpretToolIdProbe,
   READ_ONLY_DENY_RULES,
-  READ_ONLY_DISALLOWED_TOOLS
+  READ_ONLY_DISALLOWED_TOOLS,
+  TOOL_ID_PROBE_CONTROL
 } from "../plugins/grok-build/scripts/grok-bridge.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -95,10 +97,43 @@ test("a barrier that does not hold on this platform says so", () => {
   assert.deepEqual(windows.layers, ["disallowed-tools", "deny-rules"]);
   assert.match(windows.disclosure, /not enforced on this platform/);
 
-  const posix = describeConfinement(false, "linux");
-  assert.equal(posix.kernelSandbox, "enforced");
-  assert.ok(posix.layers.includes("sandbox"));
-  assert.equal(posix.disclosure, null, "nothing to disclose when every layer holds");
+  // ⚠ THIS TEST USED TO PIN THE OVERCLAIM. It asserted that `linux` alone yields `enforced`
+  // with nothing to disclose, so the suite actively defended the belief that a platform NAME
+  // implies a kernel mechanism — while SECURITY.md and the acceptance gate said otherwise.
+  // Landlock is a kernel config option and Raspberry Pi OS ships without it (measured
+  // 2026-08-09). Only a positive confirmation earns `enforced`; the other two states are
+  // distinct, and both disclose. Found by a docs-versus-code audit that read the runtime as
+  // well as the prose.
+  // macOS gets no free pass either. Seatbelt exists by construction, but nothing probes it and
+  // this project has no Mac — "the mechanism exists" is not "the CLI applied it". Two reviews
+  // reached this independently on 2026-08-09, after an earlier fix had added a disclosure and
+  // left the enum saying `enforced`, so the field a consumer branches on still overstated it.
+  const darwin = describeConfinement(false, "darwin");
+  assert.equal(darwin.kernelSandbox, "unverified", "no probe runs on darwin, so nothing is confirmed");
+  assert.ok(!darwin.layers.includes("sandbox"), "an unprobed layer is not a layer");
+  assert.match(darwin.disclosure, /unverified on macOS/);
+
+  const landlockPresent = describeConfinement(false, "linux", () => "present");
+  assert.equal(landlockPresent.kernelSandbox, "enforced");
+  assert.ok(landlockPresent.layers.includes("sandbox"));
+  assert.equal(landlockPresent.disclosure, null, "nothing to disclose when every layer holds");
+
+  const landlockAbsent = describeConfinement(false, "linux", () => "absent");
+  assert.equal(landlockAbsent.kernelSandbox, "requested-not-enforced");
+  assert.ok(!landlockAbsent.layers.includes("sandbox"), "a layer that cannot act is not a layer");
+  assert.match(landlockAbsent.disclosure, /not enforced on this kernel/);
+
+  // "Could not tell" is its own state. Collapsing it into either neighbour is the defect this
+  // release keeps finding, so it is asserted as distinct from both.
+  const landlockUnknown = describeConfinement(false, "linux", () => "unknown");
+  assert.equal(landlockUnknown.kernelSandbox, "unverified");
+  assert.ok(!landlockUnknown.layers.includes("sandbox"));
+  assert.match(landlockUnknown.disclosure, /unverified on this kernel/);
+  assert.notEqual(
+    landlockUnknown.disclosure,
+    landlockAbsent.disclosure,
+    "absent and unknown must not read alike"
+  );
 
   // Write mode has no barrier at all, which is easy to forget precisely because the
   // read-only path has three. It says so rather than staying quiet.
@@ -107,7 +142,13 @@ test("a barrier that does not hold on this platform says so", () => {
   assert.match(write.disclosure, /no confinement is enforced/);
 });
 
-test("every run says what confined it, so a missing disclosure is itself detectable", () => {
+test("every run says what confined it — including review and critique", (t) => {
+  // ⚠ THE TITLE USED TO OVERSTATE WHAT THIS COVERED. It said "every run" and exercised only
+  // `run`, while `describeConfinement` had exactly one call site — so `review` and `critique`
+  // launched under the identical read-only regime and disclosed nothing about it. A user
+  // reviewing a repository they do not trust is precisely who needs to know which layers hold,
+  // and theirs was the command that never said. Found by an architectural review 2026-08-09;
+  // the test name had promised the coverage for weeks.
   // The absence-detectability lesson, from the same project: a security assurance you
   // only emit when something is wrong cannot be distinguished from one that got dropped.
   // On Linux there is nothing to disclose and the warning is legitimately absent — so the
@@ -125,6 +166,46 @@ test("every run says what confined it, so a missing disclosure is itself detecta
 
   const payload = JSON.parse(result.stdout);
   assert.ok(payload.confinement, "every run payload carries the confinement descriptor");
+
+  // And the same for review, which shares the barrier and used to share none of the honesty.
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "reviewable.txt"), "a line worth reviewing\n", "utf8");
+  const reviewResult = run(
+    process.execPath,
+    [SCRIPT, "review", "--cwd", repo, "--json"],
+    { env: buildEnv(binDir, { CLAUDE_PLUGIN_DATA: pluginDataDir }) }
+  );
+  const reviewPayload = JSON.parse(reviewResult.stdout);
+  assert.ok(reviewPayload.confinement, "a review payload carries the confinement descriptor too");
+
+  // ⚠ AND CRITIQUE, WHICH THIS TITLE HAS NAMED SINCE 2026-08-09 WITHOUT EVER LAUNCHING IT.
+  // Found by a backlog triage 2026-08-17 and ranked second of everything still open. Not a
+  // hypothetical gap: critique is a separate branch — `handleReviewCommand(argv, { reviewName:
+  // "Critique" })` — and `executeReviewRun` already switches on that name, so a one-line
+  // `if (reviewName !== "Critique")` around the descriptor would have stayed green under a
+  // test whose own title promised otherwise. A title is quotable in release notes; this one
+  // now costs a launch to keep.
+  const critiqueResult = run(
+    process.execPath,
+    [SCRIPT, "critique", "--cwd", repo, "--json"],
+    { env: buildEnv(binDir, { CLAUDE_PLUGIN_DATA: pluginDataDir }) }
+  );
+  const critiquePayload = JSON.parse(critiqueResult.stdout);
+  assert.ok(
+    critiquePayload.confinement,
+    "a critique payload carries the confinement descriptor too — it shares the barrier, so it must share the disclosure"
+  );
+  assert.equal(
+    critiquePayload.confinement.kernelSandbox,
+    payload.confinement.kernelSandbox,
+    "critique runs under the same regime, so it must report the same state"
+  );
+  assert.equal(critiquePayload.confinement.mode, "read-only");
+  assert.equal(
+    reviewPayload.confinement.kernelSandbox,
+    payload.confinement.kernelSandbox,
+    "review runs under the same regime, so it must report the same state"
+  );
   assert.equal(payload.confinement.mode, "read-only");
   assert.ok(
     Array.isArray(payload.confinement.layers) && payload.confinement.layers.length > 0,
@@ -153,17 +234,164 @@ test("read-only removes the MCP meta-tools as well as the write tools", () => {
   // Asserted against the real constants rather than a copy: a test that restates the list
   // it is checking cannot notice the list changing (which is how grok-cli.test.mjs, which
   // passes its own literal array, would have missed this).
-  for (const tool of ["run_terminal_cmd", "search_replace", "search_tool", "use_tool"]) {
-    assert.ok(
-      READ_ONLY_DISALLOWED_TOOLS.includes(tool),
-      `${tool} must not be available to a read-only run`
-    );
-  }
+  // ⚠ EXACT MEMBERSHIP, NOT A SUBSET. This used to check that four named ids were present,
+  // which is green for any list that contains those four — so when the list grew to thirteen,
+  // the nine additions were unenforced from the moment they landed. Deleting them all would
+  // have left CI passing while the barrier they describe was gone. That is the same shape as
+  // asserting a flag can appear rather than that it does: true, and about the wrong thing.
+  //
+  // Both directions are asserted deliberately. A MISSING id means a barrier was removed. An
+  // UNEXPECTED id means one was added without being verified against the installed CLI — and
+  // an id the CLI does not know is silently inert, reading as protection while removing
+  // nothing. Two of the ids an internal roadmap prescribed (`delete_file`, `edit_notebook`)
+  // turned out not to exist at all.
+  //
+  // So changing this list is meant to cost a moment's thought: update the snapshot AND re-run
+  // the verification. That is a throwaway run with `--disallowed-tools <candidates>
+  // --debug-file <path>`, then grep the log for `disallowedTools entry matched nothing`,
+  // always with a deliberate fake among the candidates as a control — without one you cannot
+  // tell a clean result from a broken probe.
+  const EXPECTED_DISALLOWED = [
+    "run_terminal_cmd",     // the shell
+    "search_replace",       // the file editor
+    "search_tool",          // MCP meta-tool
+    "use_tool",             // MCP meta-tool
+    "write",                // observed being called on a read-only run
+    "monitor",              // advertised to the model, offers a shell path
+    "image_gen",            // the media tools all put files on disk
+    "image_edit",
+    "image_to_video",
+    "reference_to_video",
+    "web_fetch",            // retrieves whatever a URL serves; web_search stays, see below
+    "scheduler_create",     // durable state that outlives the run
+    "scheduler_delete",
+    "scheduler_list"        // not for protection — the requirement graph, see the test below
+  ];
+  assert.deepEqual(
+    [...READ_ONLY_DISALLOWED_TOOLS].sort(),
+    [...EXPECTED_DISALLOWED].sort(),
+    "read-only tool removal changed: re-verify every id against the installed CLI before updating this snapshot"
+  );
+
   assert.ok(
     !READ_ONLY_DISALLOWED_TOOLS.includes("web_search"),
     "web search stays: read-only carries research offloads, where looking things up is the task"
   );
   assert.deepEqual(READ_ONLY_DENY_RULES, ["Bash", "Write", "Edit", "MCPTool"]);
+});
+
+test("the scheduler ids are removed as a set or not at all", () => {
+  // The CLI's tools declare requirements on each other. Removing `scheduler_create` while
+  // `scheduler_list` survives makes the session fail to INITIALISE — `run` does not degrade,
+  // it dies, with an internal RequirementError naming the dependent. Measured 2026-08-08
+  // against grok 1.0.0; the shipped list carried exactly that combination and every read-only
+  // run on the tree was dead until this test existed.
+  //
+  // It is an invariant and not a snapshot on purpose: the snapshot above already pins today's
+  // membership, and would have to be edited by the same hand that breaks this. This one states
+  // the rule, so a future edit that adds or drops one scheduler id meets it here.
+  const TRIO = ["scheduler_create", "scheduler_delete", "scheduler_list"];
+  const present = READ_ONLY_DISALLOWED_TOOLS.filter((id) => id.startsWith("scheduler_"));
+  if (present.length === 0) return;
+  assert.deepEqual(
+    [...present].sort(),
+    [...TRIO].sort(),
+    "removing a scheduler tool without its dependents breaks session init — take all three or none"
+  );
+});
+
+// The snapshot above catches US changing the list. It cannot catch xAI renaming a tool
+// underneath us — the snapshot still matches, this test still passes, and the barrier quietly
+// loses a tool. `check --verify-tools` closes that by asking the binary; these four cover the
+// judgement it makes about the answer, which is the half that can be wrong without a CLI.
+const probeLine = (id) => `2026-08-08T12:00:00Z WARN  disallowedTools entry matched nothing tool=${id}`;
+// Taken from the constant rather than frozen. These tests used a hardcoded 13 while the list
+// held 14 — harmless, because `total` is only echoed back, but it advertised a number the
+// product does not use and nothing would have noticed the two diverging further.
+const TOTAL = READ_ONLY_DISALLOWED_TOOLS.length;
+
+test("the tool-id probe names exactly the ids the CLI did not recognise", () => {
+  const log = [
+    "2026-08-08T12:00:00Z INFO  starting session",
+    probeLine("delete_file"),
+    probeLine(TOOL_ID_PROBE_CONTROL),
+    "2026-08-08T12:00:01Z INFO  done"
+  ].join("\n");
+  const verdict = interpretToolIdProbe(log, TOTAL);
+  assert.equal(verdict.checked, true);
+  assert.deepEqual(verdict.unmatched, ["delete_file"], "the control must never be reported as a finding of ours");
+  assert.equal(verdict.total, TOTAL);
+});
+
+test("a clean probe reports nothing unmatched, and still proves it could have", () => {
+  const verdict = interpretToolIdProbe(probeLine(TOOL_ID_PROBE_CONTROL), TOTAL);
+  assert.deepEqual(verdict, { checked: true, total: TOTAL, unmatched: [] });
+});
+
+test("two ids on one log line are both reported, not just the first", () => {
+  // The parser ran one non-greedy exec per line, so the FIRST tool= won. With the control
+  // first, the gate passed and the real id vanished — `checked: true, unmatched: []`, a false
+  // all-clear. Today's CLI writes one id per line, so this was a contract hole rather than a
+  // live failure; it is pinned because "the format currently suits us" is nobody's commitment.
+  const log =
+    "WARN  disallowedTools entry matched nothing tool=" +
+    TOOL_ID_PROBE_CONTROL +
+    " also tool=delete_file";
+  const verdict = interpretToolIdProbe(log, TOTAL);
+  assert.equal(verdict.checked, true);
+  assert.deepEqual(verdict.unmatched, ["delete_file"], "the id after the control must not be dropped");
+});
+
+test("check --verify-tools does not exit 0 when it could not tell", () => {
+  // The flag reported honestly in text and exited 0 regardless, so every consumer without eyes
+  // — CI, a shell `&&`, a release script — read a broken or unverifiable barrier as success.
+  // That is the exact false green the release is about, in the command whose whole job is
+  // telling you the truth about your setup.
+  //
+  // The fake grok writes no --debug-file, so the probe cannot read a verdict: the honest answer
+  // is "I do not know", and the honest exit code is not 0. (2 for unknown, 1 for a real finding
+  // — different problems, different responses.)
+  const binDir = makeTempDir();
+  installFakeGrok(binDir);
+  const result = run(
+    process.execPath,
+    [SCRIPT, "check", "--verify-tools", "--json", "--cwd", makeTempDir()],
+    { env: { ...buildEnv(binDir), CLAUDE_PLUGIN_DATA: makeTempDir() } }
+  );
+  assert.equal(result.status, 2, "an unreadable probe must not report success");
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.toolIds.checked, false);
+  assert.deepEqual(report.toolIds.unmatched, []);
+  assert.ok(report.toolIds.error, "and it must say why it could not tell");
+});
+
+test("a tool= outside the warning line is not mistaken for a finding", () => {
+  // The guard added with the multi-match fix: only lines carrying the warning phrase are read.
+  // Without it, any debug line mentioning tool= would become a reported id.
+  const log = ["INFO  invoking tool=web_search", probeLine(TOOL_ID_PROBE_CONTROL)].join("\n");
+  assert.deepEqual(interpretToolIdProbe(log, TOTAL).unmatched, []);
+});
+
+test("a probe that cannot see its own control answers UNKNOWN, never all-clear", () => {
+  // This is the whole reason the control exists. Every one of these logs would read as a
+  // perfect result without it — and the last two are what xAI shipping a reworded log line
+  // or a renamed flag actually looks like from here.
+  for (const [label, log] of [
+    ["empty file", ""],
+    ["the run never got that far", "2026-08-08T12:00:00Z INFO  starting session"],
+    ["wording moved", "WARN  unknown tool in disallowed list: " + TOOL_ID_PROBE_CONTROL],
+    ["our ids reported but not the control", probeLine("web_fetch")]
+  ]) {
+    const verdict = interpretToolIdProbe(log, 13);
+    assert.equal(verdict.checked, false, `${label}: a blind probe must not report success`);
+    assert.deepEqual(verdict.unmatched, [], `${label}: an unreadable log yields no findings either`);
+    assert.match(verdict.error, /control id/, `${label}: say why it is unknown`);
+  }
+});
+
+test("the same id logged twice is one finding", () => {
+  const log = [probeLine("web_fetch"), probeLine("web_fetch"), probeLine(TOOL_ID_PROBE_CONTROL)].join("\n");
+  assert.deepEqual(interpretToolIdProbe(log, 13).unmatched, ["web_fetch"]);
 });
 
 test("the schema size cap applies to the batch path too", () => {

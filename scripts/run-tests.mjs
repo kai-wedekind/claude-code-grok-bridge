@@ -37,6 +37,26 @@ if (files.length === 0) {
   process.exit(1);
 }
 
+// ⚠ The documented read-only tool list is checked against the shipped constant HERE, before
+// the suite, because a gate nobody runs is not a gate. `check-tool-list.mjs` was written on
+// 2026-08-08 after the README shipped two copy-pasteable launch lines carrying a list that
+// cannot start a session — and it was then left out of `package.json`, out of this runner and
+// out of CI, so the exact failure it exists to prevent could recur untouched. An audit found
+// that the same day.
+//
+// Here rather than only in CI, for two reasons: it fails on the developer's machine where the
+// fix is cheap, and CI skips `**.md` pushes entirely, so a docs-only edit that introduces the
+// drift would never reach a runner. Unlike `check-test-count`, this list changes rarely, so it
+// does not create friction mid-work.
+const toolList = spawnSync(process.execPath, [path.join(ROOT, "scripts", "check-tool-list.mjs")], {
+  cwd: ROOT,
+  stdio: "inherit"
+});
+if (toolList.status !== 0) {
+  console.error("\nDocumented tool list disagrees with the shipped constant — see above.");
+  process.exit(toolList.status ?? 1);
+}
+
 const result = spawnSync(process.execPath, ["--test", ...process.argv.slice(2), ...files], {
   cwd: ROOT,
   stdio: "inherit"

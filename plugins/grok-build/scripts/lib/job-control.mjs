@@ -254,7 +254,6 @@ export function reclaimOrphanedJob(workspaceRoot, job, options = {}) {
   }
   const isGone = options.isGoneImpl ?? isProcessGone;
   const readImage = options.readImageImpl ?? readProcessImageName;
-  const terminate = options.terminateImpl ?? terminateProcessTree;
   const claimTerminal = options.claimTerminalImpl ?? claimJobTerminal;
   const nowMs = options.nowMs ?? Date.now();
   const targets = resolveJobKillTargets(job);
@@ -301,13 +300,13 @@ export function reclaimOrphanedJob(workspaceRoot, job, options = {}) {
   }
 
   if (abandonedWhileAlive) {
-    // Claim first, kill second. A record goes stale for two very different reasons:
+    // Claim, and then deliberately do not kill. A record goes stale for two very different reasons:
     // the run really was abandoned, or progress writes are failing — which is exactly
     // what a full or unwritable state volume produces while the agent works on. Since
     // recording the decision uses that same volume, a failed claim is the signal that
     // we are the broken party, and nothing may be terminated.
     const errorMessage =
-      "Abandoned: record went stale while tracked process(es) may still be running; best-effort terminate attempted.";
+      "Abandoned: record went stale while tracked process(es) may still be running. Kill targets kept; nothing was signalled — run `stop` to terminate them.";
     let claim;
     try {
       claim = claimTerminal(workspaceRoot, job.id, "failed", {
@@ -346,25 +345,40 @@ export function reclaimOrphanedJob(workspaceRoot, job, options = {}) {
     }
 
     if (claim?.claimed) {
-      for (const pid of targets) {
-        try {
-          const expectedImage = expectedImageForPid(job, pid);
-          terminate(pid, expectedImage ? { expectedImage } : {});
-        } catch (error) {
-          // Per-pid isolation stays — one failure must not skip the rest — but the
-          // failure itself gets said out loud. This is the branch that runs when a
-          // process was believed abandoned AND alive; a kill that threw here is the
-          // difference between "cleaned up" and "still burning quota".
-          try {
-            appendLogLine(
-              resolveTrustedJobLogFile(job),
-              `Reclaim could not terminate pid ${pid}: ${
-                error instanceof Error ? error.message : String(error)
-              }`
-            );
-          } catch {
-          }
-        }
+      // ⚠ DELIBERATELY NOT KILLING HERE, and this used to.
+      //
+      // The pids reaching this branch are alive, and the only evidence that they are OURS is
+      // a basename match — which `processImagesMatch` additionally waves through whenever the
+      // record carries no image or the probe failed. Fifteen minutes is long enough for the
+      // process we tracked to have exited and the operating system to have reissued its pid,
+      // and the process most likely to hold a recycled pid on this machine is ANOTHER grok
+      // agent, whose image is identical. Killing on basename plus age therefore ends someone
+      // else's run — with `--write`, mid-edit.
+      //
+      // `stop` already refuses exactly this, and says why at grok-bridge.mjs: on a machine
+      // running several agents "the recycled pid is most likely another grok.exe, which is
+      // exactly what the fingerprint waves through". Reclaim was the one path that did not
+      // apply that caution. Now both agree.
+      //
+      // Nothing is lost that the design did not already provide for: the claim above keeps
+      // the kill targets on the record precisely so `stop` can aim at them, and marks the
+      // spend incomplete so `usage` reports it as unknown rather than zero. What changes is
+      // that ending a live process is now a decision someone makes, not one a fifteen-minute
+      // timer makes on a fingerprint that cannot tell two agents apart. The cost is a truly
+      // abandoned agent continuing until someone stops it — visible in `runs`, and far
+      // cheaper than killing the wrong one silently.
+      //
+      // To kill here again, the identity check has to become decisive: a process start time
+      // earlier than this job's own start would do it, since a recycled pid cannot predate
+      // the record. Basename is not enough. Found by audit 2026-08-11.
+      try {
+        appendLogLine(
+          resolveTrustedJobLogFile(job),
+          `Reclaim found this run abandoned while pid(s) ${targets.join(", ")} are still alive. ` +
+            "Nothing was signalled: after this long a live pid cannot be told from a recycled one " +
+            "by image name alone. The targets are kept on the record — run `stop` to terminate them."
+        );
+      } catch {
       }
     }
 

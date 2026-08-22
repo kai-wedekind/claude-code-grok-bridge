@@ -28,6 +28,30 @@ test("shellForExecutable never enables shell (user argv must not hit cmd.exe)", 
   assert.equal(shellForExecutable("notes.txt"), false);
 });
 
+test("runCommand ignores a caller-supplied shell option", () => {
+  // The test above pins `shellForExecutable`, which always answers false — but that function is
+  // not on this path at all: runCommand passes a hardcoded `shell: false` to spawnSync. So the
+  // guard everyone points at proves a different thing from the one that runs, and nothing
+  // asserted the one that runs.
+  //
+  // It matters because shell:true on Windows routes user-controlled argv through cmd.exe, where
+  // `&`, `|` and `^` are syntax. A caller passing `{ shell: true }` — by habit, or by copying an
+  // options object from somewhere else — must not be able to switch that on.
+  const seen = [];
+  const spawnSyncImpl = (command, args, options) => {
+    seen.push(options);
+    return { status: 0, signal: null, stdout: "", stderr: "" };
+  };
+
+  runCommand(process.execPath, ["-e", ""], { shell: true, spawnSyncImpl });
+  runCommand(process.execPath, ["-e", ""], { shell: "cmd.exe", spawnSyncImpl });
+
+  assert.equal(seen.length, 2);
+  for (const options of seen) {
+    assert.equal(options.shell, false, "a caller must not be able to turn the shell back on");
+  }
+});
+
 test("toSpawnTarget unwraps npm-style .cmd shims to node + script", () => {
   const dir = makeTempDir();
   const scriptPath = path.join(dir, "cli.js");

@@ -45,9 +45,17 @@ function pluginName() {
 
 /** Every tracked text file that could name a skill, read once. */
 function documentationFiles() {
+  // ⚠ THE COMMAND AND AGENT MARKDOWN WENT UNSCANNED UNTIL 2026-08-17, and it is the text a
+  // user meets first: `/grok-build:review` is read out of `commands/review.md`, not out of
+  // this repository's prose. So the guard covered the documentation *about* the surfaces
+  // while leaving the surfaces' own documentation unchecked, which is the wrong way round.
+  // Found by a backlog triage. All eight references already in those files resolve, so
+  // widening the walk costs nothing today and closes the gap for the next rename.
   const roots = [
     REPO,
     path.join(REPO, "docs"),
+    path.join(REPO, "plugins", "grok-build", "commands"),
+    path.join(REPO, "plugins", "grok-build", "agents"),
     ...fs.readdirSync(SKILLS_DIR).map((d) => path.join(SKILLS_DIR, d))
   ];
   const files = [];
@@ -86,8 +94,21 @@ test("every documented plugin:name reference resolves to something that ships", 
   // would sweep up prose like "Note: something" and force the pattern to grow exceptions.
   const reference = new RegExp(`\\b${plugin}:([a-z0-9][a-z0-9-]*)\\b`, "g");
 
+  // ⚠ THE CHANGELOG IS EXEMPT, and not as a convenience. This guard exists so that no document
+  // sends a reader to a surface which does not exist. A changelog does the opposite: a
+  // `### Removed` entry has to NAME the thing it is reporting gone, and the notes for an older
+  // version must go on describing the world as it was then. Forbidding that pushes the notes
+  // towards "a command was removed", which tells a reader who has it in a script nothing at
+  // all. Every other document is still held to the rule. (2026-08-09: this fired on the 0.3.3
+  // Removed entry for the import command — correctly, by its own logic, and wrongly for the
+  // release.)
+  const historical = new Set(["CHANGELOG.md"]);
+
   const bad = new Set();
   for (const file of documentationFiles()) {
+    if (historical.has(path.basename(file))) {
+      continue;
+    }
     const body = fs.readFileSync(file, "utf8");
     for (const [, name] of body.matchAll(reference)) {
       if (!shipped.has(name)) {

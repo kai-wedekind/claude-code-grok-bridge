@@ -1,14 +1,13 @@
 ---
 description: Run a Grok Build code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model>] [--effort <low|medium|high>] [--timeout-ms <ms>] [--max-turns <n>] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
 Run a Grok Build review through the plugin bridge (read-only write barrier: `--no-plan`, `--sandbox read-only`, disallowed write tools, and deny rules — not plan mode).
 
-Raw slash-command arguments:
-`$ARGUMENTS`
+Raw slash-command arguments: `$ARGUMENTS`
 
 Core constraint:
 - This command is review-only.
@@ -36,7 +35,7 @@ Argument handling:
 - Do not strip `--wait` or `--background` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
 - `--model`, `--effort`, `--timeout-ms`, `--max-turns`, `--base`, and `--scope` are runtime-selection flags. Preserve them for the bridge call; do not treat them as review focus text.
-- Leave `--model` and `--effort` unset unless the user explicitly asks for them. Accepted effort values: `low`, `medium`, `high`.
+- Leave `--model` and `--effort` unset unless the user explicitly asks for them. Accepted effort values: `low`, `medium`, `high`, `xhigh` — measured against the CLI rather than copied from its binary, which lists three more that the flag refuses.
 - The bridge script parses `--wait` and `--background`. Bridge `--background` owns the long-running process group (detached `run-worker` + grok agent). Claude Code's `Bash(..., run_in_background: true)` is only for the short enqueue call, not the long review process.
 - If both `--background` and `--wait` are present, `--wait` wins (foreground).
 - Optional trailing positionals are focus text and are joined into the review prompt. `/grok-build:review` does not support staged-only or unstaged-only review scopes.

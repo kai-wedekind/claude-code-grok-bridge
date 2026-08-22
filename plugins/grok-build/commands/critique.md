@@ -1,16 +1,13 @@
 ---
 description: Run a Grok Build critique that challenges the implementation approach and design choices
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model>] [--effort <low|medium|high>] [--timeout-ms <ms>] [--max-turns <n>] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
-Run a Grok Build critique through the plugin bridge (read-only write barrier: `--no-plan`, `--sandbox read-only`, disallowed write tools, and deny rules — not plan mode).
-Position it as a challenge pass that questions the chosen implementation, design choices, tradeoffs, and assumptions.
-It is not just a stricter pass over implementation defects.
+Run a Grok Build critique through the plugin bridge (read-only write barrier: `--no-plan`, `--sandbox read-only`, disallowed write tools, and deny rules — not plan mode). Position it as a challenge pass that questions the chosen implementation, design choices, tradeoffs, and assumptions. It is not just a stricter pass over implementation defects.
 
-Raw slash-command arguments:
-`$ARGUMENTS`
+Raw slash-command arguments: `$ARGUMENTS`
 
 Core constraint:
 - This command is review-only.
@@ -39,7 +36,7 @@ Argument handling:
 - Do not strip `--wait` or `--background` yourself.
 - Do not weaken the critique framing or rewrite the user's focus text.
 - `--model`, `--effort`, `--timeout-ms`, `--max-turns`, `--base`, and `--scope` are runtime-selection flags. Preserve them for the bridge call; do not treat them as focus text.
-- Leave `--model` and `--effort` unset unless the user explicitly asks for them. Accepted effort values: `low`, `medium`, `high`.
+- Leave `--model` and `--effort` unset unless the user explicitly asks for them. Accepted effort values: `low`, `medium`, `high`, `xhigh` — measured against the CLI rather than copied from its binary, which lists three more that the flag refuses.
 - The bridge script parses `--wait` and `--background`. Bridge `--background` owns the long-running process group (detached `run-worker` + grok agent). Claude Code's `Bash(..., run_in_background: true)` is only for the short enqueue call, not the long critique process.
 - If both `--background` and `--wait` are present, `--wait` wins (foreground).
 - `/grok-build:critique` uses the same review target selection as `/grok-build:review`.

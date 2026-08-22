@@ -1,5 +1,20 @@
 // Modified from xai-org/grok-build-plugin-cc@5a9f924 by Kai Wedekind, 2026.
 // Apache-2.0 section 4(b) notice; see NOTICE and CHANGELOG.md for what changed.
+// "3 hours", "2 days" — for saying when a check last actually looked. Deliberately duplicated
+// from lib/version-check.mjs rather than imported: this module has no imports at all, and a
+// formatting helper is not worth making a pure renderer depend on the update machinery. The
+// duplicate is four lines of arithmetic with no shared state to drift.
+function describeAge(ageMs) {
+  if (typeof ageMs !== "number" || !Number.isFinite(ageMs) || ageMs < 0) return "an unknown time";
+  const minutes = Math.floor(ageMs / 60000);
+  if (minutes < 1) return "less than a minute";
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -217,6 +232,163 @@ function pushJobDetails(lines, job, options = {}) {
       lines.push(`    ${line}`);
     }
   }
+  // The image probe recorded its own failure and nobody ever read it. It answers exactly
+  // one question, and only at the moment it is expensive to get wrong: whether `stop` can
+  // tell that the PID it is about to signal is still the process this run started. Without
+  // an image it falls back to matching any node or grok process, which on a developer
+  // machine is a weak fingerprint. The kill still proceeds — a run that cannot be stopped
+  // is the worse failure for a tool that spends money — so this changes nothing about the
+  // policy and only makes the weaker guarantee visible to whoever reads the record.
+  if (job.agentImageProbe === "unavailable") {
+    lines.push("  ⚠ Process fingerprint unavailable — stop matches on name alone, not identity.");
+  }
+  pushSubagentStrands(lines, job, options);
+}
+
+/**
+ * What Grok's own subagents actually did.
+ *
+ * Until 0.3.3 this was invisible: the bridge kept the parent's final synthesis and dropped
+ * every strand behind it, so a fan-out that half-died looked exactly like one that
+ * succeeded — same confident answer, same charge against the weekly allowance. Measured
+ * 2026-08-09 across every run on one machine: 44 % of all strands had failed, and nothing
+ * anywhere said so.
+ *
+ * The evidence is handed in as plain data and never read here. This module has no imports
+ * and keeps it that way, so rendering stays a pure function of the record.
+ */
+export function pushSubagentStrands(lines, job, options = {}) {
+  const evidence = job.subagents;
+  if (!evidence?.strands?.length) {
+    return;
+  }
+  const { strands } = evidence;
+  const failed = strands.filter((s) => s.status === "failed").length;
+  const cancelled = strands.filter((s) => s.status === "cancelled").length;
+  const completed = strands.filter((s) => s.status === "completed").length;
+
+  // ⚠ The tally must ADD UP to the count beside it. It listed only completed, failed and
+  // cancelled, so a strand still running — or one whose meta.json was missing, which yields
+  // "unknown" — vanished from the breakdown while still counting in the total: `Subagents: 3
+  // (1 completed)`, with nothing saying where the other two went. A reader who notices assumes
+  // a display bug; a reader who does not silently under-counts the fan-out. Audit 2026-08-09.
+  const accounted = completed + failed + cancelled;
+  const tally = [`${completed} completed`];
+  if (failed) tally.push(`${failed} failed`);
+  if (cancelled) tally.push(`${cancelled} cancelled`);
+  if (strands.length > accounted) tally.push(`${strands.length - accounted} running or unknown`);
+  lines.push(`  Subagents: ${strands.length} (${tally.join(", ")})`);
+
+  for (const strand of strands) {
+    const mark = strand.status === "completed" ? "+" : strand.status === "failed" ? "!" : "-";
+    const size = strand.outputChars ? `${strand.outputChars} chars` : "no output";
+    const tools = Number.isFinite(strand.toolCalls) ? `, ${strand.toolCalls} tools` : "";
+    const label = strand.description || strand.type || strand.id;
+    lines.push(`    ${mark} [${strand.type ?? "?"}] ${label} — ${size}${tools}`);
+    if (strand.readError) {
+      lines.push(`      ! ${strand.readError}`);
+    }
+  }
+
+  // Say it plainly rather than leaving it to be inferred from the marks. A partial fan-out
+  // still bills the full allowance and still returns a synthesis that reads as complete.
+  //
+  // Count what the sentence actually claims. An earlier version said "produced nothing" while
+  // counting `failed` and `cancelled` — so a failed strand that had emitted partial text was
+  // reported as empty, and a completed one whose deliverable could not be read was quietly
+  // counted among the survivors. Audit 2026-08-09. Emptiness is now measured, not inferred
+  // from status, and the two questions are reported separately because they are different:
+  // how many strands delivered, and how much of the fan-out died.
+  //
+  // ⚠ AND A STRAND WE COULD NOT READ HAS NOT "PRODUCED NOTHING". `outputChars` stays 0 when the
+  // deliverable was refused for being over the size limit, or when its JSON would not parse —
+  // so the sentence claimed the fan-out was emptier than it was, and contradicted the
+  // per-strand `! output.json is larger than …` line printed directly above it. That is the
+  // same under-reporting this whole module exists to end, reappearing in its own summary.
+  // A `readError` means bytes exist and we declined them; that is a third state and it says so.
+  //
+  // ⚠ AND "COULD NOT BE READ" IS ONLY TRUE FOR ONE OF THE THREE readError KINDS. The flag is
+  // set when a deliverable was refused for size, when one exists but could not be parsed, and
+  // when a strand is marked completed with no deliverable at all. Saying "DID produce output"
+  // about the last is a lie: nothing was produced, which is the original defect wearing the
+  // new sentence. Only `refused` — bytes on disk we declined — earns that wording; `missing`
+  // belongs with the empty strands it actually resembles. Found by a code review 2026-08-09,
+  // hours after this sentence was written to fix the previous version of the same mistake.
+  //
+  // ⚠ AND A STRAND STILL RUNNING HAS NOT "PRODUCED NOTHING" — IT HAS NOT FINISHED. Every
+  // non-terminal strand has `outputChars` 0 and no readError, so it fell into `empty`, and
+  // `runs <id>` on a live job announced "3 of 3 strands produced nothing — this answer rests on
+  // 0" one line below a tally that correctly said "3 running or unknown". The two lines
+  // contradicted each other, and the wrong one is the one a reader takes as the verdict.
+  // Reproduced at HEAD by a code review 2026-08-09.
+  const terminal = (s) => s.status === "completed" || s.status === "failed" || s.status === "cancelled";
+  const finished = strands.filter(terminal);
+  const pending = strands.length - finished.length;
+  const unread = finished.filter((s) => !s.outputChars && s.readErrorKind === "refused").length;
+  const unusable = finished.filter((s) => !s.outputChars && s.readErrorKind === "unusable").length;
+  const delivered = finished.filter((s) => s.outputChars).length;
+  const empty = finished.length - unread - unusable - delivered;
+  if (empty > 0) {
+    lines.push(
+      `  ⚠ ${empty} of ${finished.length} finished strands produced nothing — this answer rests on ${delivered}.`
+    );
+  }
+  if (pending > 0) {
+    lines.push(`  … ${pending} strand(s) had not finished when this was read — not counted either way.`);
+  }
+  // Strands from an earlier turn of the same session. Named rather than silently filtered, so a
+  // reader who knows the thread fanned out five ways can see where the rest went.
+  if (evidence.fromOtherTurns > 0) {
+    lines.push(
+      `  · ${evidence.fromOtherTurns} strand(s) in this session belong to other turns of the thread and are not shown.`
+    );
+  }
+  if (unread > 0) {
+    lines.push(
+      `  ⚠ ${unread} further strand(s) DID produce output that this bridge declined to read (see the ! lines above) — not counted as delivered, and not empty either.`
+    );
+  }
+  if (unusable > 0) {
+    lines.push(
+      `  ⚠ ${unusable} further strand(s) left a deliverable that could not be understood — not counted as delivered, and not necessarily empty.`
+    );
+  }
+  if (evidence.droppedByCap > 0) {
+    lines.push(
+      `  ⚠ ${evidence.droppedByCap} further strand(s) exist on disk but were not read — the per-run cap was reached.`
+    );
+  }
+  // Said out loud rather than silently skipped: an entry that resolves outside the session
+  // tree is not a strand of this run, but a listing that quietly shrinks is the very thing
+  // this block exists to prevent. If this line ever appears, something planted a link in the
+  // CLI's session directory, and that is worth knowing on its own.
+  if (evidence.unreadableEntries > 0) {
+    lines.push(
+      `  ⚠ ${evidence.unreadableEntries} entr(y/ies) were listed in this run's subagents directory but could not be examined at all.`
+    );
+  }
+  if (evidence.droppedOutsideTree > 0) {
+    lines.push(
+      `  ⚠ ${evidence.droppedOutsideTree} entr(y/ies) under this run's subagents directory resolve OUTSIDE the session tree and were not read.`
+    );
+  }
+
+  if (options.showStrandOutput) {
+    for (const strand of strands) {
+      if (!strand.output) continue;
+      lines.push("");
+      lines.push(`  --- strand: ${strand.description || strand.id} [${strand.type ?? "?"}] ---`);
+      for (const line of strand.output.split("\n")) {
+        lines.push(`  ${line}`);
+      }
+      if (strand.truncated) {
+        lines.push(`  … truncated here; the full ${strand.outputChars} characters are in ${strand.sourceDir}`);
+      }
+    }
+  } else if (evidence.sessionDir) {
+    lines.push(`  Full strand outputs: ${evidence.sessionDir}`);
+    lines.push(`  Print them: /grok-build:show ${job.id} --strands`);
+  }
 }
 
 function appendReasoningSection(lines, reasoningSummary) {
@@ -244,8 +416,90 @@ export function renderSetupReport(report) {
     ""
   ];
 
+  // Only present when --verify-tools asked for it, because finding out costs a real run.
+  // ⚠ Three outcomes, and they must stay three. "Could not check" is not "fine": this list is
+  // the read-only barrier, and a probe that failed says nothing about whether it holds. The
+  // CLI's own warning for an id that matches nothing goes only to a --debug-file, so without
+  // this the failure is invisible on every surface a person sees.
+  if (report.toolIds) {
+    const tools = report.toolIds;
+    if (!tools.checked) {
+      lines.push(`- read-only tool ids: NOT CHECKED — ${tools.error || "the probe did not run"}`);
+      lines.push("  This is not an all-clear: the barrier's ids remain unverified against this CLI.");
+    } else if (tools.unmatched.length > 0) {
+      lines.push(`- read-only tool ids: ${tools.unmatched.length} of ${tools.total} MATCH NOTHING`);
+      lines.push(`  ${tools.unmatched.join(", ")}`);
+      lines.push("  Each removes no tool. The read-only barrier is weaker than the code claims.");
+    } else {
+      lines.push(`- read-only tool ids: all ${tools.total} recognised by this CLI`);
+    }
+    lines.push("");
+  }
+
+  // ⚠ UNCONDITIONAL, exactly like the tool-id block above and for the same reason: an omitted
+  // line reads as "nothing to report", which is indistinguishable from "fine". Four states, and
+  // `unknown` says in words that it is not an all-clear.
+  {
+    const update = report.update ?? { state: "unknown", reason: "no version check ran" };
+    lines.push("Version:");
+    if (update.state === "behind") {
+      lines.push(
+        `- update: UPDATE AVAILABLE — running ${update.running}, latest release ${update.latest}`
+      );
+      lines.push("  https://github.com/kai-wedekind/claude-code-grok-bridge/releases/latest");
+    } else if (update.state === "current" && update.stale) {
+      // ⚠ `current` is a positive claim about the present, and a stale observation cannot
+      // support it — upstream may have shipped since. `behind` from the same cache stays
+      // `behind`, because that one can only under-report. Found by an audit, 2026-08-08.
+      lines.push(
+        `- update: unknown — running ${update.running}, and the last successful check was ` +
+          `${describeAge(update.ageMs)} ago (it saw ${update.latest})`
+      );
+      lines.push("  Too old to call you current. Run `check --fetch-update` to ask now.");
+    } else if (update.state === "current") {
+      lines.push(
+        `- update: current — running ${update.running}, latest release ${update.latest}` +
+          (typeof update.ageMs === "number" ? ` (checked ${describeAge(update.ageMs)} ago)` : "")
+      );
+    } else if (update.state === "ahead") {
+      lines.push(
+        `- update: running ${update.running}, ahead of the latest release ${update.latest}`
+      );
+    } else {
+      lines.push(`- update: unknown — ${update.reason || "no check has run yet"}`);
+      lines.push("  This is not an all-clear. Run `check --fetch-update` to ask now.");
+    }
+    lines.push("  Status: above covers node, grok and auth only — it does not include version state.");
+    lines.push("");
+  }
+
   if (report.bridge) {
     lines.push("Bridge:");
+    // A01. The install path first, because every other line in this report describes
+    // whatever build that path holds — and a stale one makes all of them true about the
+    // wrong code. Sources that stay silent are omitted rather than printed as "unknown":
+    // a developer running from a clone has no version directory and no registry, and
+    // filling the report with n/a would train people to skip the block.
+    const install = report.bridge.install;
+    if (install?.installDir) {
+      lines.push(`- loaded from: ${install.installDir}`);
+    }
+    if (install?.directoryVersion) {
+      lines.push(`- install directory says: ${install.directoryVersion}`);
+    }
+    if (install?.manifestVersion) {
+      lines.push(`- manifest says: ${install.manifestVersion}`);
+    }
+    if (install?.registryVersion) {
+      lines.push(`- Claude Code registry says: ${install.registryVersion}`);
+    }
+    if (install?.disagreements?.length) {
+      lines.push(`- ⚠ these disagree, so at least one of them is describing code that is not running:`);
+      for (const detail of install.disagreements) {
+        lines.push(`    ${detail}`);
+      }
+      lines.push("    Reinstall or redeploy the plugin before trusting a version number here.");
+    }
     if (report.bridge.stateRoot) {
       lines.push(`- state root: ${report.bridge.stateRoot}`);
     }
@@ -331,12 +585,16 @@ export function renderReviewResult(parsedResult, meta) {
   if (!parsedResult.parsed) {
     const headline =
       failureHeadline(meta?.failureCode) ?? "Grok did not return valid structured JSON.";
+    // ⚠ The same double already fixed at the three other call sites in this file: for most
+    // failure codes `failureMessage` IS the headline, so printing both gives the reader the
+    // identical sentence twice with "- Details:" in front of the second one. Detail is only
+    // detail when it says something the headline did not.
+    const detail = meta?.failureMessage || parsedResult.parseError;
     const lines = [
       `# Grok Build ${meta.reviewLabel}`,
       "",
       headline,
-      "",
-      `- Details: ${meta?.failureMessage || parsedResult.parseError}`
+      ...(detail && detail !== headline ? ["", `- Details: ${detail}`] : [])
     ];
 
     if (parsedResult.rawOutput) {
@@ -592,7 +850,12 @@ export function renderJobStatusReport(job) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderStoredJobResult(job, storedJob) {
+/**
+ * The result body. Kept separate from the export because it has a dozen early returns —
+ * appending the strand block to each of them is a dozen chances to miss one, and the one
+ * missed would be a silent hole exactly where this release promises there is none.
+ */
+function renderStoredJobResultBody(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `grok -r ${threadId}` : null;
   const status = job?.status ?? storedJob?.status ?? null;
@@ -720,6 +983,16 @@ export function renderStoredJobResult(job, storedJob) {
   }
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderStoredJobResult(job, storedJob, options = {}) {
+  const base = renderStoredJobResultBody(job, storedJob);
+  const strandLines = [];
+  pushSubagentStrands(strandLines, job, options);
+  if (strandLines.length === 0) {
+    return base;
+  }
+  return `${base.trimEnd()}\n\n${strandLines.join("\n")}\n`;
 }
 
 export function renderCancelReport(job) {

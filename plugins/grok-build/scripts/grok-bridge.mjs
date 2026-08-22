@@ -10,7 +10,6 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
-import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import {
@@ -23,8 +22,8 @@ import {
   isPlausibleSchemaObject,
   parseStructuredOutput,
   readOutputSchema,
+  runGrok,
   runHeadlessAgent,
-  runImport,
   schemaInstructionsFromPath
 } from "./lib/grok.mjs";
 import {
@@ -48,6 +47,7 @@ import {
   assertValidThreadName,
   claimJobTerminal,
   cleanTerminalJobs,
+  assertValidSessionId,
   deleteNamedThread,
   generateJobId,
   getNamedThread,
@@ -60,6 +60,7 @@ import {
   resolveTrustedJobLogFile,
   resolveStateRoot,
   upsertJob,
+  writeFileAtomic,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -87,12 +88,49 @@ import {
   renderTaskResult,
   validateReviewResultShape
 } from "./lib/render.mjs";
+import { collectSubagentEvidence } from "./lib/subagents.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
+/**
+ * The reasoning-effort levels the Grok CLI's `--effort` flag accepts.
+ *
+ * ⚠ THESE FOUR ARE MEASURED, NOT COPIED, and where they came from matters more than the list.
+ * Read from the shipped binary you get `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+ * `max`, which looks exactly like the flag's set and is not it — those seven belong to
+ * something else in that binary. `grok --help` documents no values for the flag whatsoever.
+ * The only authoritative statement of the set is the CLI's own rejection, which you can
+ * obtain solely by getting it wrong:
+ *
+ *     grok --effort __probe__ -p x
+ *     Error: --effort/--reasoning-effort: unknown effort level '__probe__';
+ *            use one of: xhigh, high, medium, low
+ *
+ * Measured that way on 2026-08-21 against grok 1.0.5 (Windows) and grok 1.0.0 (Raspberry Pi),
+ * which answer identically. `max`, `minimal` and `none` are refused by both.
+ *
+ * ⚠ THE FAILURE MODE THIS LIST HAS ALREADY CAUSED ONCE. It sat at three while xAI shipped
+ * `xhigh` with grok-4.6, so the CLI's highest reasoning level was unreachable through this
+ * plugin for months — and it failed as a *validation error*, which reads like a typo rather
+ * than a missing capability. Nothing here noticed, because nothing here was looking.
+ *
+ * It was briefly replaced by forwarding whatever the caller typed and letting the CLI judge.
+ * That removed the staleness and bought a worse problem: a misspelt effort then failed at CLI
+ * launch as `failureCode: "cli-error"`, the same code that means the CLI died mid-task, which
+ * calls for the opposite response. Fast, local, unambiguous refusal is worth more than
+ * automatic tracking of a set that has not moved between the two CLI versions testable here.
+ *
+ * ⚠ SO THE STALENESS IS REAL AND UNSOLVED, and the honest mitigation is the probe above: when
+ * a level is missing, re-measure rather than reasoning about the binary. `check --verify-tools`
+ * does the equivalent for the read-only tool ids; doing it for effort is on the 0.4.0 list.
+ *
+ * The membership check doubles as an argv guard, which is the one part that must not be lost
+ * if this ever becomes permissive again: a value that could be read as a flag must never reach
+ * argv, or `--effort --write` would smuggle a second option into the CLI call.
+ */
+const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
 // Windows caps a command line near 32k and the schema travels on it, so anything past
 // this fails inside spawn() with ENAMETOOLONG rather than anywhere a caller can read.
 const MAX_JSON_SCHEMA_CHARS = 16000;
@@ -111,14 +149,13 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/grok-bridge.mjs check [--json]",
-      "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [--timeout-ms <ms>] [--max-turns <n>] [focus text]",
-      "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [--timeout-ms <ms>] [--max-turns <n>] [focus text]",
+      "  node scripts/grok-bridge.mjs check [--verify-tools] [--fetch-update] [--json]",
+      "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [focus text]",
+      "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [focus text]",
       "  node scripts/grok-bridge.mjs usage [--days <n>] [--include-test-workspaces] [--json]",
-      "  node scripts/grok-bridge.mjs run [--background] [--write] [--thread <name>] [--json-schema <json>] [--prompt-file <path>] [--prompts-file <path>] [--resume-last|--resume|--fresh (default)] [--model <model>] [--effort <low|medium|high>] [--timeout-ms <ms>] [--max-turns <n>] [prompt]",
-      "  node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--thread <name>] [--json]",
+      "  node scripts/grok-bridge.mjs run [--background] [--write] [--thread <name>] [--json-schema <json>] [--prompt-file <path>] [--prompts-file <path>] [--resume-last|--resume|--fresh (default)] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [prompt]",
       "  node scripts/grok-bridge.mjs runs [run-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--all] [--all-sessions] [--json]",
-      "  node scripts/grok-bridge.mjs show [run-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
+      "  node scripts/grok-bridge.mjs show [run-id] [--wait] [--strands] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
       "  node scripts/grok-bridge.mjs stop [run-id] [--json]",
       "  node scripts/grok-bridge.mjs threads [--forget <name>] [--json]",
       "  node scripts/grok-bridge.mjs clean [--keep <n>] [--older-than-ms <ms>] [--json]",
@@ -131,7 +168,8 @@ function printUsage() {
       "",
       "Env (bridge):",
       "  GROK_BINARY, GROK_CC_MAX_CONCURRENCY (0=unbounded), GROK_CC_SLOT_WAIT_MS,",
-      "  GROK_CC_SESSION_ID, GROK_CC_TRANSCRIPT_PATH, CLAUDE_PLUGIN_DATA,",
+      "  GROK_CC_SESSION_ID, GROK_CC_UPDATE_CHECK (0/off/false/no disables it),",
+      "  CLAUDE_PLUGIN_DATA,",
       "  GROK_CC_STDOUT_CAP_BYTES (test knob; production default 32 MiB)"
     ].join("\n")
   );
@@ -213,7 +251,7 @@ function normalizeReasoningEffort(effort) {
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: low, medium, high.`
+      `Unsupported reasoning effort "${effort}". Use one of: low, medium, high, xhigh.`
     );
   }
   return normalized;
@@ -330,6 +368,19 @@ async function buildCheckReport(cwd, actionsTaken = []) {
   const slotWaitMs = resolveEffectiveSlotWaitMs();
   const stateRoot = resolveStateRoot();
 
+  // A01. Same dynamic import the version block below uses — `version-check.mjs` is loaded on
+  // demand rather than at module scope, and `check` is the only command that needs it. A
+  // failure here must not take the whole report down: this line describes the install, and a
+  // report that refuses to print because it cannot name a version is worse than one that
+  // omits the name.
+  let install = null;
+  try {
+    const vc = await import("./lib/version-check.mjs");
+    install = vc.describeInstallIdentity(import.meta.url);
+  } catch {
+    install = null;
+  }
+
   const nextSteps = [];
   if (!grokStatus.available) {
     nextSteps.push("Install the Grok Build CLI and ensure `grok` is on PATH (or set GROK_BINARY).");
@@ -340,6 +391,9 @@ async function buildCheckReport(cwd, actionsTaken = []) {
   }
 
   return {
+    // ⚠ `ready` stays node + grok + auth. Version state is reported separately and
+    // deliberately does NOT fold in here: `--verify-tools` already overloads exit 1 and 2, and
+    // being three releases behind is not the same kind of fact as "the CLI is missing".
     ready: nodeStatus.available && grokStatus.available && authStatus.loggedIn,
     node: nodeStatus,
     grok: grokStatus,
@@ -348,7 +402,11 @@ async function buildCheckReport(cwd, actionsTaken = []) {
     bridge: {
       stateRoot,
       maxConcurrency,
-      slotWaitMs
+      slotWaitMs,
+      // A01. Which build is actually loaded, and whether the three places that name a
+      // version agree. `import.meta.url` is the only one of them that cannot lie: it is
+      // the path Node resolved to reach this file.
+      install
     },
     envHints: [
       `GROK_BINARY=${process.env.GROK_BINARY || "(default: grok on PATH)"}`,
@@ -362,10 +420,160 @@ async function buildCheckReport(cwd, actionsTaken = []) {
   };
 }
 
+/**
+ * Read a probe's debug log and say which of our ids the CLI did not recognise.
+ *
+ * Split out from the spawn so the judgement is testable. The spawn is not: it needs the real
+ * binary, real auth and real allowance. Everything that can be wrong without those — the log
+ * wording moving, the parse breaking, a green being manufactured out of an empty file — is in
+ * here, and is covered by the unit suite.
+ */
+function interpretToolIdProbe(log, total) {
+  // The CLI names the offending id on the line, so read them off rather than guessing which
+  // of ours failed to match.
+  //
+  // ⚠ EVERY `tool=` on the line, not the first. The original ran one `exec` per line, and with
+  // a non-greedy `.*?` the FIRST id won — so a line naming the control alongside a real id
+  // reported only the control, passed the gate below, and returned `checked: true` with the
+  // real one silently dropped. Today's CLI writes one id per line, so this was a hole in the
+  // contract rather than a live false clear. Closed anyway: "the format currently happens to
+  // suit us" is not a property anybody is maintaining. (Found by an independent audit of the
+  // commit that introduced it, 2026-08-08.)
+  const unmatched = [];
+  for (const line of String(log).split(/\r?\n/)) {
+    if (!line.includes("disallowedTools entry matched nothing")) continue;
+    for (const hit of line.matchAll(/tool=(\S+)/g)) {
+      if (!unmatched.includes(hit[1])) unmatched.push(hit[1]);
+    }
+  }
+
+  // THE CONTROL, and the reason this check is worth having. We pass one id that cannot exist,
+  // so a working probe MUST report it. If it does not, the probe is blind — the log wording
+  // moved, the flag was renamed, the parse broke — and the honest answer is "I do not know",
+  // never "all clear". Without this, the check degrades into a permanent green the first time
+  // xAI rewords one log line, which is exactly the silent-failure shape it exists to expose.
+  if (!unmatched.includes(TOOL_ID_PROBE_CONTROL)) {
+    return {
+      checked: false,
+      total,
+      unmatched: [],
+      error: "the probe's own control id was not reported — cannot read this CLI's log"
+    };
+  }
+  return {
+    checked: true,
+    total,
+    unmatched: unmatched.filter((id) => id !== TOOL_ID_PROBE_CONTROL)
+  };
+}
+
+/**
+ * Ask the installed CLI whether it still recognises every id in the read-only removal list.
+ *
+ * WHY THIS IS NEEDED AT ALL. An id the CLI does not know removes nothing. It sits in the list
+ * reading as protection, and the barrier is one tool weaker than the code claims. The CLI does
+ * notice — it emits `disallowedTools entry matched nothing` — but only into the `--debug-file`
+ * log, which nothing reads unless someone goes looking.
+ *
+ * Measured 2026-08-08 against grok 1.0.0, passing a deliberately bogus id: **stderr was 0
+ * bytes**, stdout was the model's answer and nothing else, and the sole trace was one line in
+ * the debug file. So the failure is invisible on every surface a person actually sees.
+ *
+ * ⚠ The unit suite pins this list against a SNAPSHOT, which catches us changing it. It cannot
+ * catch xAI renaming a tool underneath us: the snapshot still matches, the test still passes,
+ * and the barrier quietly degrades. That is the gap this closes, and it is why the check has
+ * to talk to the binary rather than to our own constant.
+ *
+ * 🚫 OPT-IN ON PURPOSE. The warning is emitted at session spawn, so there is no way to ask
+ * without starting a real run and spending real allowance. A `check` that quietly billed the
+ * user every invocation would be its own small dishonesty, in the command whose whole job is
+ * telling you the truth about your setup.
+ */
+function verifyDisallowedToolIds(cwd) {
+  const total = READ_ONLY_DISALLOWED_TOOLS.length;
+  const unknown = (error) => ({
+    checked: false,
+    total,
+    unmatched: [],
+    error
+  });
+  const debugFile = path.join(os.tmpdir(), `grok-cc-toolcheck-${process.pid}-${Date.now()}.log`);
+  try {
+    // ⚠ The same flags a real read-only run uses, not a minimal subset. A probe that spawns a
+    // DIFFERENT session from the one we ship can only answer for the session it spawned — and
+    // the requirement graph, which is the thing that killed us, is a property of the whole flag
+    // set. `--no-plan` in particular is not decoration: plan mode dead-ends headless.
+    const result = runGrok(
+      [
+        "-p",
+        "Reply with the single word OK.",
+        "--no-plan",
+        "--sandbox",
+        "read-only",
+        "--disallowed-tools",
+        [...READ_ONLY_DISALLOWED_TOOLS, TOOL_ID_PROBE_CONTROL].join(","),
+        ...READ_ONLY_DENY_RULES.flatMap((rule) => ["--deny", rule]),
+        "--debug-file",
+        debugFile
+      ],
+      // ⚠ BOUND IT. This spawns a real model run, and it had no timeout while every other
+      // launch path in the bridge does — so a wedged CLI or a stalled network hangs `check`
+      // indefinitely, with no output. That is the diagnostic command hanging on exactly the
+      // broken environment it exists to diagnose, which is worse than it failing: a hang gives
+      // the reader nothing at all to act on. Two minutes is far beyond a healthy probe (a real
+      // one answers in seconds) and far short of "I'll come back later". Found by a code review
+      // 2026-08-09.
+      { cwd, timeoutMs: 120000 }
+    );
+    // runCommand RETURNS a failure, it does not throw one — so a run that died on auth or on
+    // an exhausted allowance would otherwise sail past the catch and be read off a log that
+    // never described this probe.
+    if (result.error) return unknown(result.error.message);
+    if (result.signal || result.status !== 0) {
+      const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`;
+      // ⚠ A requirement-graph failure is NOT the same class as "not signed in". Both leave a
+      // non-zero exit, and bucketing them together is what made this bug take an afternoon:
+      // the report said "the probe did not run", so it read as an environment problem rather
+      // than as a broken removal list. It is the one failure here that IS about our list, so
+      // it gets named and gets its own finding.
+      if (/requirements unsatisfied|session initialization failed/i.test(detail)) {
+        const dependent = /tool:\s*\\?"([^\\"]+)/.exec(detail);
+        return {
+          checked: false,
+          total,
+          unmatched: [],
+          // ⚠ The discriminator that reaches the EXIT CODE. `checked: false` is right — we
+          // learned nothing about the individual ids — but this failure is nonetheless a
+          // finding about OUR list, not about the environment, and the two want different
+          // exit codes and different human responses. Without this flag it shared code 2
+          // with "not signed in", so automation would retry forever against a dead barrier.
+          listBroken: true,
+          requiresAlso: dependent ? dependent[1] : null,
+          error:
+            `the removal list stops this CLI from starting a session at all` +
+            (dependent ? ` — it also wants ${dependent[1]} removed` : "") +
+            `. Every read-only run is dead until the list is fixed.`
+        };
+      }
+      return unknown(detail);
+    }
+    if (!fs.existsSync(debugFile)) return unknown("the CLI wrote no debug log");
+    return interpretToolIdProbe(fs.readFileSync(debugFile, "utf8"), total);
+  } catch (error) {
+    // A failed probe is not a clean bill of health, and must never read as one.
+    return unknown(error instanceof Error ? error.message : String(error));
+  } finally {
+    try {
+      fs.rmSync(debugFile, { force: true });
+    } catch {
+    }
+  }
+}
+
 async function handleCheck(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "verify-tools", "fetch-update"]
   });
 
   const cwd = resolveCommandCwd(options);
@@ -375,6 +583,60 @@ async function handleCheck(argv) {
   } catch {
   }
   const finalReport = await buildCheckReport(cwd, []);
+
+  // Version state, always reported. Cache-only unless asked to fetch: `check` is a diagnostic
+  // and should not make an outbound request every time somebody runs it, but it is also the
+  // one command whose job is telling you the truth about your setup, so it must never omit
+  // this line — an omitted line reads as "fine", which is the failure this release is about.
+  try {
+    const vc = await import("./lib/version-check.mjs");
+    const running = vc.resolveRunningVersion(import.meta.url);
+    // ⚠ An EXPLICIT --fetch-update overrides the ambient opt-out, and says so when it cannot.
+    // Gating the explicit request on `GROK_CC_UPDATE_CHECK=0` meant the flag silently did
+    // nothing, and the report then typically ended "Run `check --fetch-update` to ask now" —
+    // recommending the exact command that had just been suppressed, with nothing saying why.
+    // The opt-out exists to stop the plugin reaching the network ON ITS OWN; a person typing
+    // the flag is not the plugin acting on its own. Found by a code review 2026-08-09.
+    if (options["fetch-update"]) {
+      const { cache } = await vc.readCacheBounded(2000);
+      const result = await vc.fetchLatestVersion({ timeoutMs: vc.FETCH_TIMEOUT_MS, running });
+      const next = vc.recordFetchResult(cache, result, Date.now());
+      try {
+        writeFileAtomic(vc.resolveUpdateCacheFile(), `${JSON.stringify(next, null, 2)}\n`);
+      } catch {
+      }
+      finalReport.update = vc.evaluateUpdateState(next, running);
+    } else {
+      const { cache } = await vc.readCacheBounded(2000);
+      finalReport.update = vc.evaluateUpdateState(cache, running);
+    }
+  } catch (error) {
+    finalReport.update = {
+      state: "unknown",
+      running: null,
+      latest: null,
+      reason: error instanceof Error ? error.message : String(error)
+    };
+  }
+  if (options["verify-tools"]) {
+    finalReport.toolIds = verifyDisallowedToolIds(cwd);
+    // ⚠ The verdict has to reach the EXIT CODE, not only the text. A check that prints
+    // "3 of 14 MATCH NOTHING" and then exits 0 is read as success by everything that does not
+    // have eyes — CI, a shell `&&`, a release script — which is the precise false-green shape
+    // this command exists to remove. `1` for a real finding, `2` for "I could not tell",
+    // because those want different responses: fix the list, versus fix the environment and
+    // ask again. (Found by an independent audit, 2026-08-08: the flag reported honestly and
+    // exited 0 regardless.)
+    if (finalReport.toolIds.unmatched.length > 0 || finalReport.toolIds.listBroken) {
+      // 1 = a real finding about the list. `listBroken` belongs here and not with the unknowns:
+      // it means the removal list stops the CLI from starting a session at all, which is the
+      // most severe thing this command can discover, and it was landing on 2 — the code that
+      // tells automation to fix its environment and try again.
+      process.exitCode = 1;
+    } else if (!finalReport.toolIds.checked) {
+      process.exitCode = 2;
+    }
+  }
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
@@ -421,8 +683,48 @@ function isActiveJobStatus(status) {
  * input/cache-read/output split, and those differ twentyfold in price — a number invented
  * from them would be worse than an honest gap.
  */
+/**
+ * Sum two launches' spend, keeping "we could not tell" distinguishable from "it was zero".
+ * A missing side yields the side we have — the caller records `spendIncomplete` separately, so
+ * the number is the best available and the record still says it is partial.
+ */
+function addUsage(a, b) {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  const out = {};
+  for (const k of keys) {
+    const left = typeof a[k] === "number" ? a[k] : 0;
+    const right = typeof b[k] === "number" ? b[k] : 0;
+    out[k] = left + right;
+  }
+  return out;
+}
+
+function addCostTicks(a, b) {
+  if (!Number.isInteger(a)) return Number.isInteger(b) ? b : null;
+  return Number.isInteger(b) ? a + b : a;
+}
+
+function addCostUsd(a, b) {
+  if (typeof a !== "number") return typeof b === "number" ? b : null;
+  return typeof b === "number" ? a + b : a;
+}
+
+function addTurns(a, b) {
+  if (!Number.isInteger(a)) return Number.isInteger(b) ? b : null;
+  return Number.isInteger(b) ? a + b : a;
+}
+
 function usageUnaccounted(result, failureCode) {
   if (result.usageIncomplete === true) {
+    return true;
+  }
+  // A nudged run whose two launches could not both be measured is partial accounting, and must
+  // say so even though it succeeded. Every other branch here keys off a FAILURE code, so a
+  // successful-but-half-counted run had no way to be marked. That is precisely the run this
+  // matters for: the nudge fires when a turn produced nothing, which is the expensive case.
+  if (result.spendIncomplete === true) {
     return true;
   }
   return (
@@ -485,6 +787,19 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 
   const trackedTask = findLatestResumableTaskJob(visibleJobs);
   if (trackedTask) {
+    // ⚠ VALIDATE IT HERE TOO. This id becomes a path segment inside the CLI and reaches argv as
+    // `-r <value>` — which is precisely why `assertValidSessionId` exists, and why its own
+    // comment says it refuses path-like values "so a tampered named-threads.json cannot
+    // redirect resume into an attacker-chosen path". The named-thread route enforces it, and
+    // `subagents.mjs` independently re-derives the same guard for the same value. This route,
+    // reading straight off a job record on disk, was the one way around it. Two enforcing paths
+    // and one open one is worse than none: the guard's existence is what stops anyone looking.
+    // Found by an architectural review 2026-08-09.
+    //
+    // Honest scope: anyone who can edit the stored record already controls the prompt, so this
+    // closes an inconsistency rather than an exposure. It goes in because the value is a PATH
+    // fragment, which is the case the guard was written for.
+    assertValidSessionId(trackedTask.threadId);
     return { id: trackedTask.threadId };
   }
 
@@ -502,6 +817,10 @@ async function executeReviewRun(request) {
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
   const context = collectReviewContext(request.cwd, target);
+  // Read-only always, on both return paths below. Computed once here so neither can be added
+  // later without it — the previous shape put this in the task run only, and `review` inherited
+  // the barrier while inheriting none of the honesty about it.
+  const reviewConfinement = describeConfinement(false);
 
   let prompt;
   let structured = false;
@@ -525,7 +844,8 @@ async function executeReviewRun(request) {
     prompt,
     agent: "explore",
     // Same read-only regime as the task path: real tool removal + deny rules instead
-    // of interactive plan mode, which dead-ends headless.
+    // of interactive plan mode, which dead-ends headless — and, since 2026-08-09, the same
+    // disclosure, computed here so both return paths carry it. `review` is never a write run.
     noPlan: true,
     sandbox: "read-only",
     disallowedTools: READ_ONLY_DISALLOWED_TOOLS,
@@ -663,6 +983,17 @@ async function executeReviewRun(request) {
     }
     const payload = {
       review: reviewName,
+      // ⚠ SAY WHAT CONFINED THIS RUN, exactly as the task path does. `describeConfinement` had
+      // a single call site, inside the task run — so `review` and `critique` launched under the
+      // identical read-only regime and disclosed nothing about it: no "sandbox not enforced on
+      // this platform" on Windows, no Landlock-absent line on a kernel without it. A user
+      // reviewing an untrusted repository is the case that most needs to know which layers are
+      // actually holding, and it was the one command that never said. Found by an architectural
+      // review 2026-08-09. ⚠ The real fix is to make this a property of the LAUNCH rather than
+      // of each command — otherwise a fifth command is born without it — and that refactor is
+      // 0.4.0; this closes the hole in the meantime.
+      confinement: reviewConfinement,
+      warnings: reviewConfinement.disclosure ? [reviewConfinement.disclosure] : [],
       // The bridge's own exit class, like the task payload carries. `show` reads this
       // to reproduce the exit code of a stored run; without it a review that failed
       // with 2 replays as a generic 1 and the failure class is lost.
@@ -751,6 +1082,12 @@ async function executeReviewRun(request) {
 
   const payload = {
     review: reviewName,
+    // Same descriptor as the structured branch, for the same reason. Two return paths out of
+    // one function is exactly how a disclosure ends up on one of them: the failure-headline
+    // fix earlier in this file's history had to be applied to each branch separately, each
+    // time with a comment explaining what the missing copy had done wrong.
+    confinement: reviewConfinement,
+    warnings: reviewConfinement.disclosure ? [reviewConfinement.disclosure] : [],
     // Same reason as the structured branch: `show` replays the exit class from here.
     status: exitStatus,
     target,
@@ -807,16 +1144,83 @@ async function executeReviewRun(request) {
 // Tools removed outright from read-only runs (headless-only flag). `search_replace`
 // is the file-editing tool, `run_terminal_cmd` the shell — the two write paths.
 // `search_tool` and `use_tool` are the MCP meta-tools: they do not write anything
-// themselves, they reach a server that might. The deny rule below already rejects the
-// MCPTool class at call time (verified by injection, 2026-07-28), but removing the two
-// entry points as well costs nothing and does not depend on one rule engine getting a
-// pattern right. Taken from tylersue/claude-grok-delegation, which pairs a positive
-// allowlist with `--deny 'MCPTool(*)'` for exactly this reason.
+// themselves, they reach a server that might. The deny rule below is intended to reject
+// the MCPTool class at call time as well, so removing the two entry points does not
+// depend on one rule engine getting a pattern right. Taken from
+// tylersue/claude-grok-delegation, which pairs a positive allowlist with
+// `--deny 'MCPTool(*)'` for exactly this reason.
+//
+// ⚠ That deny rule is UNVERIFIED against the current CLI, and this comment used to claim
+// otherwise — "verified by injection, 2026-07-28". That date precedes CLI 1.0.0 by ten
+// days, the check was never repeated against it, and this host has no MCP servers
+// configured at all, so there was nothing for an injection to reach. The claim is
+// withdrawn rather than reworded. Note also that the id-verification method used for the
+// list below does NOT cover rule names: `--deny` and `--disallowed-tools` are separate
+// namespaces, so `Bash`, `Write`, `Edit` and `MCPTool` are all still untested.
 //
 // Deliberately NOT disallowing `web_search`, which that project also blocks: its
 // read-only mode exists for code review, ours also carries research offloads where
-// looking things up is the task.
-const READ_ONLY_DISALLOWED_TOOLS = ["run_terminal_cmd", "search_replace", "search_tool", "use_tool"];
+// looking things up is the task. `web_fetch` IS removed, and the two are not the same
+// thing: search returns results, fetch retrieves whatever a URL serves, and SECURITY.md
+// treats fetched content as untrusted input on the same terms as repository content.
+//
+// ⚠ EVERY ID BELOW WAS VERIFIED AGAINST THE INSTALLED CLI, because an id that matches
+// nothing is silently inert — it reads as protection in this list and removes no tool.
+// The CLI does warn (`disallowedTools entry matched nothing`), but only into the
+// `--debug-file` log, which nobody reads. Method, so it can be repeated when the CLI
+// moves: pass the candidates to a throwaway run with `--debug-file`, then grep that log
+// for `matched nothing`, and always include a deliberate fake as a control — without one
+// you cannot tell a clean result from a broken probe.
+//
+// Measured 2026-08-08 against grok 1.0.0 (3cd0d0cbce). Two ids that looked obvious are
+// NOT real and were dropped rather than added: `delete_file` and `edit_notebook`. So was
+// `spawn_subagent`, `kill_command_or_subagent` and `open_page`. Note also that the names
+// the MODEL reports for its own tools are not these ids — it calls the shell
+// `run_terminal_command`, which matches nothing here, while `run_terminal_cmd` is right.
+const READ_ONLY_DISALLOWED_TOOLS = [
+  // The two direct write paths.
+  "run_terminal_cmd",
+  "search_replace",
+  // The MCP meta-tools: they write nothing themselves, they reach a server that might.
+  "search_tool",
+  "use_tool",
+  // Observed being called on a read-only run, and stopped only by the deny rule below.
+  "write",
+  // Advertised to the model and offers a shell path of its own.
+  "monitor",
+  // Media generation. Every one of these puts a file on disk, which is a write however
+  // pleasant the output; they were missing from this list entirely.
+  "image_gen",
+  "image_edit",
+  "image_to_video",
+  "reference_to_video",
+  // Retrieves whatever a URL serves. See the web_search note above for why only this half.
+  "web_fetch",
+  // Creates and removes scheduled work that outlives the run. A read-only run that leaves
+  // a scheduler entry behind has changed the machine, which is the thing read-only denies.
+  //
+  // ⚠ ALL THREE OR NONE. `scheduler_list` is read-only and looks like padding here, but the
+  // CLI's tools declare requirements on one another: remove `scheduler_create` while
+  // `scheduler_list` survives and the session does not start AT ALL —
+  //   Couldn't create session: Internal error: "session initialization failed: tool error:
+  //   Requirements unsatisfied: [RequirementError { tool: "GrokBuild:scheduler_list", ... }]"
+  // Measured 2026-08-08 against grok 1.0.0 by bisecting the list: create alone fails, delete
+  // alone is fine, create+list fails naming delete, create+list+delete starts. For the whole
+  // of that failure `run` is dead — not degraded, dead. The invariant is pinned in
+  // tests/contract-sweep.test.mjs so the next edit meets it there and not in production.
+  //
+  // ⚠ AND THE GENERAL LESSON, which is bigger than the scheduler: an id can be REAL and still
+  // be FATAL TO REMOVE. The `matched nothing` probe above proves an id exists. It says nothing
+  // about whether the session still starts without it, because that failure happens later and
+  // on a different surface. Both questions have to be asked.
+  "scheduler_create",
+  "scheduler_delete",
+  "scheduler_list"
+];
+// The control id from the method described above, kept here beside the list it guards. It is
+// passed alongside the real ids by `check --verify-tools` and MUST come back reported; a probe
+// that cannot see its own planted failure cannot vouch for the others either.
+const TOOL_ID_PROBE_CONTROL = "grok_cc_probe_control_not_a_tool";
 // Second layer: deny rules reject these tool classes even if a tool is reintroduced
 // (e.g. by a subagent or a future default-tool change).
 const READ_ONLY_DENY_RULES = ["Bash", "Write", "Edit", "MCPTool"];
@@ -824,10 +1228,26 @@ const READ_ONLY_DENY_RULES = ["Bash", "Write", "Edit", "MCPTool"];
 /**
  * What actually confined this run — and, more to the point, what only looked like it did.
  *
- * `--sandbox read-only` is passed on every read-only run and is enforced by the kernel on
- * Linux and macOS. On Windows it is accepted and not enforced — "not enforced" rather than
- * "does nothing", because xAI documents effects that follow from merely requesting a
- * profile, and the public docs were corrected to say so. That was written down in
+ * `--sandbox read-only` is passed on every read-only run. Whether anything enforces it is a
+ * property of the KERNEL, not of the platform name: xAI documents Landlock on Linux and
+ * Seatbelt on macOS, and Landlock is a build option that mainstream images ship without. On
+ * Windows it is accepted and not enforced — "not enforced" rather than "does nothing", because
+ * xAI documents effects that follow from merely requesting a profile, and the public docs were
+ * corrected to say so.
+ *
+ * ⚠ This paragraph said "is enforced by the kernel on Linux and macOS" until 2026-08-09, which
+ * contradicted the probe twenty lines below it and told anyone reading the surrounding function
+ * the old story first. A stale comment beside corrected code is worse than no comment: it reads
+ * as the author's intent.
+ *
+ * Measured 2026-08-08 against grok 1.0.0 (3cd0d0cbce), no plugin involved: a direct
+ * `grok -p "<create a file>" --sandbox read-only --cwd <empty dir>` exited 0 and the file
+ * was there. So on Windows this is an observation now, not an inference from
+ * documentation — and the CLI says nothing while it happens: stderr was zero bytes. The
+ * disclosure below is OURS. Acceptance step 2b re-runs that measurement every release, and
+ * fails if the write is ever refused, so this comment cannot quietly outlive its evidence.
+ *
+ * That was written down in
  * the comments and in the README and nowhere the caller of a single run could see it: the
  * flag appeared on the command line, the run succeeded, and the payload said nothing about
  * a layer that had silently not applied.
@@ -842,7 +1262,31 @@ const READ_ONLY_DENY_RULES = ["Bash", "Write", "Edit", "MCPTool"];
  * Write mode gets the same treatment for the opposite reason: it has no barrier at all,
  * which is easy to forget precisely because the read-only path has three.
  */
-function describeConfinement(write, platform = process.platform) {
+/**
+ * Is Landlock actually ACTIVE on this kernel? Three answers, never two.
+ *
+ * ⚠ The LSM list says what is running; the kernel build config would only say what was
+ * compiled, and those differ — `lsm=` at boot can leave Landlock out of a kernel that carries
+ * it. An unreadable or unmounted securityfs is `unknown`, which is not `absent`: a probe that
+ * failed to answer must not be read as a definite no, in either direction.
+ *
+ * ⚠ This duplicates `detect_sandbox_mechanism` in `scripts/acceptance.sh`, and the duplication
+ * is not accidental — one is shell in a release gate, the other is JS at runtime, and neither
+ * can call the other. If the rule changes, both change. Injectable so the three branches are
+ * testable on a host that only ever produces one of them.
+ */
+function detectLandlock(impl) {
+  if (typeof impl === "function") {
+    return impl();
+  }
+  try {
+    return /landlock/i.test(fs.readFileSync("/sys/kernel/security/lsm", "utf8")) ? "present" : "absent";
+  } catch {
+    return "unknown";
+  }
+}
+
+function describeConfinement(write, platform = process.platform, landlockImpl = undefined) {
   if (write) {
     return {
       mode: "write",
@@ -854,17 +1298,89 @@ function describeConfinement(write, platform = process.platform) {
         "the containment."
     };
   }
-  const kernelEnforced = platform !== "win32";
+  // ⚠ Name the platforms that ARE enforced rather than excluding the one that is not.
+  // `platform !== "win32"` reported FreeBSD, Android, AIX and anything else Node runs on as
+  // kernel-enforced with no disclosure — a claim resting on nothing. xAI documents exactly
+  // two mechanisms, Landlock on Linux and Seatbelt on macOS, and names none elsewhere.
+  //
+  // The direction of the mistake is what makes it worth fixing: an unlisted platform got the
+  // reassuring answer by default, which is the wrong way round for a security descriptor.
+  // Now an unknown platform is treated like Windows — barriers 1 and 2, and a disclosure
+  // saying the third is unverified here rather than quietly asserting it works.
+  // ⚠ AND "linux" IS NOT A MECHANISM EITHER — the same overclaim, one level in. Landlock is a
+  // KERNEL CONFIG OPTION, and Raspberry Pi OS ships without it: measured 2026-08-09 on
+  // 6.12.96+rpt-rpi-2712, where the write landed and the CLI said nothing. So this descriptor
+  // told every Linux user that a third barrier held, while SECURITY.md and the acceptance gate
+  // said the opposite. Docs and code disagreeing about a security property is the defect;
+  // which of the two is wrong is a detail.
+  //
+  // Only a POSITIVE confirmation earns `enforced`. A probe that could not answer yields
+  // `unverified` WITH a disclosure, never silence — the same asymmetry the acceptance detector
+  // uses, for the same reason: saying "unknown" costs a sentence, and saying "enforced" wrongly
+  // costs the reader their guard.
+  const landlock = platform === "linux" ? detectLandlock(landlockImpl) : null;
+  // ⚠ macOS DOES NOT EARN `enforced` EITHER — this was the last platform-name claim left in
+  // the function. Seatbelt is part of the OS, so the mechanism exists by construction; but no
+  // probe runs, this project has no Mac, and the README says macOS is unverified in real use.
+  // "The mechanism exists" and "the CLI applied it" are different facts, and the first was
+  // being reported as the second. An earlier fix today added a disclosure and left the enum
+  // saying `enforced`, so the structured field — the one a consumer branches on — still
+  // overstated it while the prose beside it admitted the assumption. Two independent reviews
+  // reached this on 2026-08-09 without seeing each other's work.
+  const kernelEnforced = landlock === "present";
   return {
     mode: "read-only",
     layers: kernelEnforced
       ? ["disallowed-tools", "deny-rules", "sandbox"]
       : ["disallowed-tools", "deny-rules"],
-    kernelSandbox: kernelEnforced ? "enforced" : "requested-not-enforced",
+    // ⚠ THE ENUM AND THE PROSE MUST AGREE, and they did not off the two axes the tests cover.
+    // `requested-not-enforced` means "we asked, and we know it does not hold" — true for
+    // Windows, and for a Linux kernel we probed and found no Landlock on. On FreeBSD, Android
+    // or anything else, nothing was ever probed: the disclosure said "unverified" while this
+    // field said "not enforced", and a machine consumer reads this field. Overconfidence in the
+    // structured channel is worse than in the prose, because nothing downstream re-reads the
+    // sentence. Found by a code review 2026-08-09.
+    kernelSandbox: kernelEnforced
+      ? "enforced"
+      : platform === "win32" || landlock === "absent"
+        ? "requested-not-enforced"
+        : "unverified",
+    // Two different statements, and conflating them would be the same overclaim in a new
+    // place: on Windows this is measured, and anywhere else undocumented it is unverified.
+    // Saying "a write still lands" on a platform nobody has tested would be inventing
+    // evidence; saying only "unverified" about Windows would be throwing evidence away.
+    //
+    // ⚠ macOS resolves to `unverified`, not `enforced`. Seatbelt is part of the OS rather
+    // than a build option, so the mechanism is almost certainly there — but nothing here
+    // probes it, this project has no Mac, and "the mechanism exists" is not the same as
+    // "the CLI applied it". Only `landlock === "present"` earns `enforced` (see
+    // `kernelEnforced` above); macOS gets the disclosure branch and `kernelSandbox:
+    // "unverified"`, same footing as any platform whose mechanism was not confirmed.
     disclosure: kernelEnforced
       ? null
-      : "Sandbox not enforced on this platform (win32): --sandbox read-only is passed and " +
-        "ignored. Tool removal and deny rules are the whole barrier here."
+      : platform === "darwin"
+        ? "Sandbox enforcement unverified on macOS: Seatbelt is part of the OS, so the mechanism " +
+          "is almost certainly there — but nothing here probes it, this project has no Mac, and " +
+          "a mechanism existing is not the same as the CLI applying it. Tool removal and deny " +
+          "rules are what the barrier actually rests on."
+        : landlock === "absent"
+        ? "Sandbox not enforced on this kernel: --sandbox read-only is passed, but Landlock is " +
+          "not among the active LSMs, so there is nothing to enforce it with and the CLI does " +
+          "not say so. Measured on Raspberry Pi OS 2026-08-09, where the write landed. Tool " +
+          "removal and deny rules are the whole barrier here."
+        : landlock === "unknown"
+          ? "Sandbox enforcement unverified on this kernel: /sys/kernel/security/lsm could not " +
+            "be read, so whether Landlock is active is unknown — which is not the same as it " +
+            "being absent, and is reported rather than assumed either way. Tool removal and " +
+            "deny rules are the barrier being relied on."
+          : platform === "win32"
+        ? "Sandbox not enforced on this platform (win32): --sandbox read-only is passed, but a " +
+          "write still lands — measured against grok 1.0.0, and the CLI itself says nothing. " +
+          "Tool removal and deny rules are the whole barrier here."
+        : `Sandbox enforcement unverified on this platform (${platform}): xAI documents Landlock ` +
+          "on Linux and Seatbelt on macOS and names no mechanism for anything else, so this " +
+          "bridge does not assume one. Tool removal and deny rules are the barrier being relied " +
+          "on. Nobody has measured whether the sandbox holds here — that is a gap, not a claim."
   };
 }
 
@@ -940,9 +1456,23 @@ async function executeTaskRun(request) {
 
     // Read-only enforcement, in this order of reliability:
     //  1. --disallowed-tools removes the writing/executing tools from the toolset
-    //     (headless-only, and the only barrier that holds on Windows).
+    //     (headless-only). Every id is verified against the installed CLI — see the list
+    //     itself for why, and for how to re-verify when the registry moves.
     //  2. --deny rules reject those tool classes even if a tool slips back in.
-    //  3. --sandbox read-only adds real kernel enforcement on Linux/macOS.
+    //  3. --sandbox read-only is always passed; kernel enforcement is reported only where
+    //     a probe confirms it (Landlock present on Linux → `enforced`). macOS is
+    //     `unverified` (Seatbelt exists by construction, nothing here probes the CLI
+    //     applying it); Windows and Landlock-absent Linux are `requested-not-enforced`.
+    //     Measured 2026-08-08 against grok 1.0.0 on Windows: a direct run with the flag
+    //     set wrote the file anyway, exit 0, and stderr was empty — the CLI does not say
+    //     so. Acceptance step 2b re-checks the mechanism on every release.
+    //
+    // ⚠ Layers 1 and 2 BOTH hold on Windows. An earlier version of this comment called
+    // layer 1 "the only barrier that holds on Windows", which is wrong and was wrong in
+    // the one place a maintainer reads before deciding which layer is safe to drop: a live
+    // 1.0.0 run showed the DENY RULES doing the stopping, and layer 1 covering neither
+    // attempted path. Two independent layers, and the ordering above is about how much
+    // each is trusted, not about which platforms each survives.
     // Plan mode is NOT used as a barrier: its "present plan, await approval" fork
     // dead-ends in headless mode (the stub bug), hence --no-plan.
     // The agent's working directory is the directory the CALLER asked for, not the
@@ -1038,9 +1568,29 @@ async function executeTaskRun(request) {
           nudged = true;
           // Prefer the retry, but never drop the first structuredOutput if the nudge
           // did not produce one (failed/empty retry must not erase the first SO).
+          //
+          // ⚠ AND CARRY THE FIRST ATTEMPT'S SPEND. Replacing the result wholesale threw away
+          // the first launch's `usage`, `costTicks` and `numTurns`, so the record described TWO
+          // CLI turns with ONE turn's cost — and `usageIncomplete` stayed false, because the
+          // retry carried usage and nothing asked whether anything was missing. The ledger then
+          // summed a confident, wrong number, and there is no quota endpoint to reconcile it
+          // against; the local record is the only view there is.
+          //
+          // It undercounts hardest where it hurts most: the trigger is "a turn was spent and no
+          // text came back", which is exactly what a `--max-turns` exhaustion emits. Measured
+          // 2026-08-09 against the suite's own `empty-then-ok` fixture — 2 launches, one turn's
+          // usage recorded, `usageIncomplete: false`. Found by an architectural review.
+          //
+          // If either attempt reported no usage at all we cannot sum honestly, so the record
+          // says so rather than presenting a partial total as complete.
           result = {
             ...retry,
-            structuredOutput: retry.structuredOutput ?? firstResult.structuredOutput ?? null
+            structuredOutput: retry.structuredOutput ?? firstResult.structuredOutput ?? null,
+            usage: addUsage(firstResult.usage, retry.usage),
+            costTicks: addCostTicks(firstResult.costTicks, retry.costTicks),
+            costUsd: addCostUsd(firstResult.costUsd, retry.costUsd),
+            numTurns: addTurns(firstResult.numTurns, retry.numTurns),
+            spendIncomplete: !firstResult.usage || !retry.usage
           };
         } catch (error) {
           // A failed retry must not destroy the (empty but honest) first result.
@@ -1352,56 +1902,6 @@ function buildTaskRequest({
     jsonSchema: jsonSchema ?? null,
     timeoutMs: timeoutMs ?? null,
     maxTurns: maxTurns ?? null
-  };
-}
-
-function renderTransferResult(payload) {
-  const lines = [
-    "Imported the Claude session into a Grok session.",
-    payload.threadId ? `Grok session ID: ${payload.threadId}` : "Grok session ID: (not detected in import output)",
-    payload.resumeCommand ? `Resume in Grok: ${payload.resumeCommand}` : "Resume with: grok -r <session-id>"
-  ];
-  if (payload.thread) {
-    lines.push(
-      payload.threadRegistered
-        ? `Named thread registered: ${payload.thread}`
-        : `Named thread not registered (${payload.thread}): ${payload.threadRegistrationError || "import produced no session id"}`
-    );
-  }
-  return `${lines.join("\n")}\n`;
-}
-
-async function executeTransfer(cwd, options = {}) {
-  ensureGrokAvailable(cwd);
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const sourcePath = resolveClaudeSessionPath(cwd, {
-    source: options.source
-  });
-  const result = runImport(cwd, { sourcePath });
-  let threadRegistered = false;
-  let threadRegistrationError = "";
-  if (options.thread && result.threadId) {
-    try {
-      setNamedThread(workspaceRoot, options.thread, result.threadId);
-      threadRegistered = true;
-    } catch (error) {
-      threadRegistrationError = error?.message ?? String(error);
-    }
-  }
-  const payload = {
-    threadId: result.threadId,
-    resumeCommand: result.resumeCommand ?? (result.threadId ? `grok -r ${result.threadId}` : null),
-    sourcePath,
-    sessionId: path.basename(sourcePath, ".jsonl"),
-    stdout: result.stdout,
-    thread: options.thread ?? null,
-    threadRegistered,
-    threadRegistrationError: threadRegistrationError || null
-  };
-
-  return {
-    payload,
-    rendered: renderTransferResult(payload)
   };
 }
 
@@ -1939,22 +2439,6 @@ function handleUsage(argv) {
   outputCommandResult(report, renderUsage(report), options.json);
 }
 
-async function handleTransfer(argv) {
-
-  const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "source", "thread"],
-    booleanOptions: ["json"]
-  });
-
-  const cwd = resolveCommandCwd(options);
-  const thread = options.thread ? assertValidThreadName(options.thread) : null;
-  const { payload, rendered } = await executeTransfer(cwd, {
-    source: options.source,
-    thread
-  });
-  outputCommandResult(payload, rendered, options.json);
-}
-
 async function readStoredJobWithRetry(workspaceRoot, jobId, options = {}) {
   const attempts = options.attempts ?? 10;
   const delayMs = options.delayMs ?? 25;
@@ -2070,7 +2554,11 @@ async function handleStatus(argv) {
           pollIntervalMs: options["poll-interval-ms"]
         })
       : buildSingleJobSnapshot(cwd, reference);
-    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    // Single job, so one directory scan is affordable — which makes the strand block in
+    // pushJobDetails reachable in production instead of dead code. The runs LIST stays without
+    // it on purpose: one scan per row turns a cheap listing into a filesystem sweep.
+    const statusJob = withSubagentEvidence(snapshot.job, cwd);
+    outputCommandResult({ ...snapshot, job: statusJob }, renderJobStatusReport(statusJob), options.json);
     // Wait deadline exceeded while the job is still active: distinct exit for scripting.
     if (options.wait && snapshot.waitTimedOut) {
       process.exitCode = 3;
@@ -2089,10 +2577,58 @@ async function handleStatus(argv) {
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
+/**
+ * Attach what Grok's own subagents produced, read from the CLI's session directory.
+ *
+ * Deliberately not done for the runs LIST: locating a session costs a directory scan, and
+ * doing that per row turns a cheap listing into a filesystem sweep. A single job is worth
+ * one scan; fifty are not.
+ *
+ * Failures are swallowed on purpose. This is evidence, not the result — a session
+ * directory that moved, or a `GROK_HOME` on a drive that is no longer mounted, must not
+ * turn a completed run into an error at display time.
+ */
+/**
+ * ⚠ A SESSION IS NOT A RUN, and this attached one run's evidence to every run sharing a session.
+ *
+ * `threadId` is the Grok session id, and `--thread` and `--resume` reuse it deliberately — that
+ * reuse is what makes a conversation continue across calls. But the CLI writes every subagent of
+ * every turn into that one session directory, so reading it whole hands a resumed run the union
+ * of all strands ever spawned in the thread, presented as its own fan-out.
+ *
+ * Measured 2026-08-09 against this machine's state root: **36 session ids are shared by two or
+ * more runs**, one of them a thread created that same evening. A continuation that spawned
+ * nothing would report "Subagents: 5 (2 failed)" and "this answer rests on 3" — the same block
+ * on every run of the thread. A confident wrong count, in the feature this release headlines,
+ * in exactly the category the feature exists to end. Found by a full-release code review.
+ *
+ * The window is the run's own lifetime, and where a bound cannot be read the strand is KEPT and
+ * the result says the filter was partial: dropping evidence because a timestamp would not parse
+ * is the same defect with the sign flipped.
+ */
+// Exported, and the collector injectable, so a test can assert that the run's OWN window
+// reaches the reader. Verifying the filter in isolation is not the same as verifying that it is
+// wired to the right dates — and the wiring is the part that, if it regressed, would silently
+// restore a whole thread's history to every run in it.
+export function withSubagentEvidence(job, cwd, collect = collectSubagentEvidence) {
+  if (!job?.threadId) {
+    return job;
+  }
+  try {
+    const subagents = collect(job.threadId, {
+      cwd,
+      window: { from: job.startedAt ?? job.createdAt ?? null, to: job.completedAt ?? null }
+    });
+    return subagents ? { ...job, subagents } : job;
+  } catch {
+    return job;
+  }
+}
+
 async function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
-    booleanOptions: ["json", "wait"]
+    booleanOptions: ["json", "wait", "strands"]
   });
 
   const cwd = resolveCommandCwd(options);
@@ -2112,20 +2648,30 @@ async function handleResult(argv) {
       return;
     }
     const storedJob = readStoredJob(snapshot.workspaceRoot, snapshot.job.id);
-    const payload = { job: snapshot.job, storedJob };
-    outputCommandResult(payload, renderStoredJobResult(snapshot.job, storedJob), options.json);
-    process.exitCode = resolveStoredJobExitStatus(snapshot.job, storedJob);
+    const waitedJob = withSubagentEvidence(snapshot.job, cwd);
+    const payload = { job: waitedJob, storedJob };
+    outputCommandResult(
+      payload,
+      renderStoredJobResult(waitedJob, storedJob, { showStrandOutput: options.strands }),
+      options.json
+    );
+    process.exitCode = resolveStoredJobExitStatus(waitedJob, storedJob);
     return;
   }
 
-  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
+  const { workspaceRoot, job: baseJob } = resolveResultJob(cwd, reference);
+  const job = withSubagentEvidence(baseJob, cwd);
   const storedJob = readStoredJob(workspaceRoot, job.id);
   const payload = {
     job,
     storedJob
   };
 
-  outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+  outputCommandResult(
+    payload,
+    renderStoredJobResult(job, storedJob, { showStrandOutput: options.strands }),
+    options.json
+  );
   // Surface stored status as process exit so scripts can await-result without parsing JSON.
   process.exitCode = resolveStoredJobExitStatus(job, storedJob);
 }
@@ -2539,9 +3085,6 @@ async function main() {
     case "run":
       await handleTask(argv);
       break;
-    case "import":
-      await handleTransfer(argv);
-      break;
     case "run-worker":
       await handleTaskWorker(argv);
       break;
@@ -2571,8 +3114,41 @@ async function main() {
   }
 }
 
-const isMain =
-  process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+/**
+ * Resolve a path to its real location, following symlinks and Windows junctions.
+ *
+ * `path.resolve` normalises a path but never asks the filesystem what it points at, so a
+ * link and its target normalise to two different strings. Falls back to `resolve` when the
+ * file cannot be stat'ed — a path that does not exist cannot be a match anyway, and throwing
+ * here would turn a startup detail into a crash.
+ *
+ * `realpathSync.native` is preferred on Windows because it also normalises drive-letter case,
+ * which differs between how a shell spells argv[1] and how Node spells import.meta.url.
+ */
+function canonicalPath(candidate) {
+  try {
+    return (fs.realpathSync.native ?? fs.realpathSync)(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+// WHY THIS IS NOT A ONE-LINER ANY MORE.
+//
+// The original compared `path.resolve(argv[1])` against `fileURLToPath(import.meta.url)`.
+// Reach this file through a symlink or a Windows directory junction — which needs no
+// administrator rights and no developer mode — and the two strings differ, `isMain` is false,
+// `main()` never runs, and the process exits 0 having printed nothing.
+//
+// That is the worst failure this project recognises: not an error, but a success-shaped
+// silence. Measured here 2026-08-08 — direct invocation printed 3257 characters and exited 0;
+// the same command through a junction printed 0 characters and exited 0. Nothing distinguishes
+// it from a run that legitimately had nothing to say. Independently reported upstream as
+// issue #22 by benngermin, whose second suggestion — make an unrecognised entrypoint exit
+// non-zero — is the half that generalises past this bug, and is implemented below.
+const SELF_PATH = canonicalPath(fileURLToPath(import.meta.url));
+const ENTRY_PATH = process.argv[1] ? canonicalPath(process.argv[1]) : null;
+const isMain = ENTRY_PATH !== null && ENTRY_PATH === SELF_PATH;
 
 if (isMain) {
   main().catch((error) => {
@@ -2580,6 +3156,24 @@ if (isMain) {
     process.stderr.write(`${message}\n`);
     process.exitCode = 1;
   });
+} else if (
+  ENTRY_PATH !== null &&
+  path.basename(ENTRY_PATH).toLowerCase() === path.basename(SELF_PATH).toLowerCase()
+) {
+  // Node was told to execute a file with this name, yet the two paths still disagree after
+  // resolving both. Whatever the cause, this process was meant to do something and will not.
+  //
+  // Being imported is the ordinary reason `isMain` is false, and an import has some other
+  // script in argv[1] — a test runner, a wrapper — so the basename guard leaves that path
+  // untouched. Only the case that looks like execution is refused, and it is refused loudly:
+  // exit 1 matches how main() reports its own failures a few lines above.
+  process.stderr.write(
+    "grok-bridge: refusing to run — this file was invoked as a script, but its own path " +
+      `(${SELF_PATH}) does not match the entrypoint (${ENTRY_PATH}).\n` +
+      "Exiting non-zero rather than doing nothing quietly, because an empty success is " +
+      "indistinguishable from a run that had nothing to report.\n"
+  );
+  process.exitCode = 1;
 }
 
 export {
@@ -2589,5 +3183,7 @@ export {
   describeConfinement,
   MAX_JSON_SCHEMA_CHARS,
   READ_ONLY_DISALLOWED_TOOLS,
-  READ_ONLY_DENY_RULES
+  READ_ONLY_DENY_RULES,
+  TOOL_ID_PROBE_CONTROL,
+  interpretToolIdProbe
 };

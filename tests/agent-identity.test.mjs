@@ -93,16 +93,30 @@ test("a kill target with no recorded image is still checked before it is signall
 });
 
 test("the two images a run can start are accepted without a recorded image", () => {
+  // A07, and the consequence is not the flakiness it was filed as. Liveness does NOT
+  // short-circuit this function — it gates the identity check alone. So on any host where
+  // pid 4321 does not exist, and `process.kill(4321, 0)` answers ESRCH on this one, the
+  // image branch is skipped entirely, the kill proceeds, and the assertions below pass
+  // without the acceptance logic they are named for ever running. Measured 2026-08-09 with
+  // the fixture as it stood: image probe consulted false, kill reached true. Green, and
+  // proving nothing. `imageProbed` is ASSERTED rather than merely steered, so a regression
+  // in the steering cannot quietly restore that.
   let killed = null;
+  let imageProbed = false;
   const outcome = terminateProcessTree(4321, {
     platform: "win32",
-    readImageImpl: () => "grok.exe",
+    isGoneImpl: () => false,
+    readImageImpl: () => {
+      imageProbed = true;
+      return "grok.exe";
+    },
     runCommandImpl: (command, args) => {
       killed = { command, args };
       return { status: 0, stdout: "", stderr: "" };
     }
   });
 
+  assert.equal(imageProbed, true, "the identity check must actually run, or this proves nothing");
   assert.equal(outcome.method, "taskkill");
   assert.equal(killed.command, "taskkill");
   assert.ok(killed.args.includes("4321"));
@@ -110,17 +124,24 @@ test("the two images a run can start are accepted without a recorded image", () 
 
 test("a probe that cannot read the image still allows the kill", () => {
   // Unchanged policy, and deliberately so: it is about platforms where the image cannot be
-  // read at all, not about records that never wrote one down.
+  // read at all, not about records that never wrote one down. Same A07 correction — without
+  // steering, this asserted a kill that had not been gated on anything.
   let killed = false;
+  let imageProbed = false;
   const outcome = terminateProcessTree(4321, {
     platform: "win32",
-    readImageImpl: () => null,
+    isGoneImpl: () => false,
+    readImageImpl: () => {
+      imageProbed = true;
+      return null;
+    },
     runCommandImpl: () => {
       killed = true;
       return { status: 0, stdout: "", stderr: "" };
     }
   });
 
+  assert.equal(imageProbed, true, "the unreadable-image branch must be the one exercised");
   assert.equal(outcome.delivered, true);
   assert.equal(killed, true);
 });
