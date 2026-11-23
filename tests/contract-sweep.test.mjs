@@ -118,10 +118,16 @@ test("a barrier that does not hold on this platform says so", () => {
   assert.ok(landlockPresent.layers.includes("sandbox"));
   assert.equal(landlockPresent.disclosure, null, "nothing to disclose when every layer holds");
 
+  // Current CLIs refuse to start `read-only` when Landlock is absent, so the bridge does not
+  // ask for it, and `not-requested` records exactly that.
   const landlockAbsent = describeConfinement(false, "linux", () => "absent");
-  assert.equal(landlockAbsent.kernelSandbox, "requested-not-enforced");
-  assert.ok(!landlockAbsent.layers.includes("sandbox"), "a layer that cannot act is not a layer");
-  assert.match(landlockAbsent.disclosure, /not enforced on this kernel/);
+  assert.equal(landlockAbsent.kernelSandbox, "not-requested");
+  assert.deepEqual(landlockAbsent.layers, ["disallowed-tools", "deny-rules"]);
+  assert.match(landlockAbsent.disclosure, /Landlock is not among the active LSMs/);
+  assert.match(landlockAbsent.disclosure, /refuse to start/);
+  assert.match(landlockAbsent.disclosure, /--sandbox off/);
+  assert.match(landlockAbsent.disclosure, /grok 1\.0\.70/);
+  assert.match(landlockAbsent.disclosure, /Tool removal and deny rules are the whole barrier/);
 
   // "Could not tell" is its own state. Collapsing it into either neighbour is the defect this
   // release keeps finding, so it is asserted as distinct from both.
@@ -220,6 +226,14 @@ test("every run says what confined it — including review and critique", (t) =>
     assert.ok(
       payload.warnings.some((entry) => /Sandbox not enforced/.test(entry)),
       "a degraded barrier has to reach warnings, not only the descriptor"
+    );
+  }
+  // Linux without Landlock. The sandbox was not asked for; the warning has to say so.
+  if (payload.confinement.kernelSandbox === "not-requested") {
+    assert.equal(payload.confinement.mode, "read-only");
+    assert.ok(
+      payload.warnings.some((entry) => /--sandbox off/.test(entry)),
+      "passing off has to reach warnings, not only the descriptor"
     );
   }
 });

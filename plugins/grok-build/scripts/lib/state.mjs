@@ -63,6 +63,162 @@ export function resolveStateRoot() {
   return pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
 }
 
+const DISABLED_FLAG_FILE = "disabled.json";
+
+/**
+ * A manual, persistent kill switch — one file, `~/.grok-cc/disabled.json` (or
+ * `GROK_CC_DISABLED_FLAG`), not beside the subscription cache at the state root, checked
+ * before any command that would spend the account's weekly Grok allowance or its paid
+ * overage credits.
+ *
+ * ⚠ THIS IS DELIBERATELY NOT AUTOMATIC. The CLI's own `~/.grok/logs/unified.jsonl` carries a
+ * `creditUsagePercent` reading (with `onDemandCap` / `onDemandUsed` / `onDemandEnabled`
+ * alongside it) that looks at first like exactly the signal an automatic gate would want. It
+ * is not usable as one: that line is written only when an INTERACTIVE `grok` session starts,
+ * never by a headless run — so a bridge that only ever runs headlessly, which is every run
+ * this plugin makes, never refreshes it. Measured 2026-09-06: the newest reading was three
+ * days stale while the subscription page already showed the allowance used up, and every
+ * sampled reading showed `onDemandCap` and `onDemandUsed` both at 0 regardless of
+ * `creditUsagePercent` — so there is no confirmed mapping from that field to "currently
+ * spending paid overage" in the first place. A gate built on a signal that goes silent exactly
+ * when it matters is worse than no gate, so this does not build one. What is reliable is a
+ * flag the user sets the moment they see the real number on the account page, and that is
+ * what this is.
+ *
+ * The file records who disabled it and why, not merely that it is disabled, because a bare
+ * boolean forgets its own reason the moment it is set and every later reader has to guess.
+ */
+//
+// ⚠ ONE LOCATION FOR EVERY CALLER, not the state root. resolveStateRoot() follows
+// CLAUDE_PLUGIN_DATA and falls back to a temp directory when that is unset, so a flag kept there
+// would let `disable` typed into a shell without the variable write a flag the plugin never
+// reads, and the plugin would keep spending while the shell said it would not. The flag lives
+// under the user's home, independent of who calls. GROK_CC_DISABLED_FLAG overrides the path
+// (the tests use it so they never touch the real home). A leading ~ expands to the home
+// directory; anything still not absolute is refused, because path.resolve would anchor a
+// relative path to each process's own cwd and a background worker runs in the run's directory.
+// The bridge writes no flag under the state root, so that location is not read.
+const DISABLED_FLAG_ENV = "GROK_CC_DISABLED_FLAG";
+
+// `~`, `~/…` and `~\…` only. `~other` is a different user's home and is not expanded.
+function expandLeadingHome(value) {
+  if (value === "~") {
+    return os.homedir();
+  }
+  if (value.startsWith("~/") || value.startsWith("~\\")) {
+    const rest = value.slice(2);
+    return rest ? path.join(os.homedir(), rest) : os.homedir();
+  }
+  return value;
+}
+
+function absoluteOverrideRefusal(raw) {
+  return {
+    reason: `${DISABLED_FLAG_ENV} must be an absolute path (got ${JSON.stringify(String(raw))})`,
+    disabledAt: "unknown",
+    path: String(raw)
+  };
+}
+
+function resolveDisabledFlagLocation() {
+  const override = process.env[DISABLED_FLAG_ENV];
+  if (!override) {
+    return { path: path.join(os.homedir(), ".grok-cc", DISABLED_FLAG_FILE) };
+  }
+  const expanded = expandLeadingHome(override);
+  if (!path.isAbsolute(expanded)) {
+    return { refusal: absoluteOverrideRefusal(override) };
+  }
+  return { path: path.resolve(expanded) };
+}
+
+export function resolveDisabledFlagPath() {
+  const located = resolveDisabledFlagLocation();
+  if (located.refusal) {
+    throw new Error(located.refusal.reason);
+  }
+  return located.path;
+}
+
+function killSwitchPathError(verb, file, error) {
+  const code = error?.code ?? "error";
+  return new Error(`Cannot ${verb} the kill-switch flag at ${file} (${code}); delete it by hand.`);
+}
+
+// Only a file that does not exist means "not disabled". Every other outcome — unreadable,
+// unparseable, the wrong shape — counts as disabled, with a reason that says which, because a
+// half-written, edited or locked flag must not quietly re-enable spending.
+function readFlagFile(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    // `path` is what the refusal names. A directory here is EISDIR on read and EPERM on unlink,
+    // so `enable` reports the path instead of the raw OS error.
+    return {
+      reason: `the disable flag file ${file} exists but could not be read (${error?.code ?? "error"}) — treating as disabled until fixed`,
+      disabledAt: "unknown",
+      path: file
+    };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {
+      reason: `the disable flag file ${file} could not be parsed — treating as disabled until fixed`,
+      disabledAt: "unknown",
+      path: file
+    };
+  }
+  if (parsed && typeof parsed.reason === "string" && typeof parsed.disabledAt === "string") {
+    return parsed;
+  }
+  return {
+    reason: `the disable flag file ${file} is not a valid flag record — treating as disabled until fixed`,
+    disabledAt: "unknown",
+    path: file
+  };
+}
+
+export function readDisabledFlag() {
+  const located = resolveDisabledFlagLocation();
+  if (located.refusal) {
+    return located.refusal;
+  }
+  return readFlagFile(located.path);
+}
+
+export function writeDisabledFlag(reason) {
+  const record = { reason, disabledAt: nowIso() };
+  const file = resolveDisabledFlagPath();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeFileAtomic(file, JSON.stringify(record, null, 2));
+  } catch (error) {
+    // A directory (or any unwritable entry) at the flag path would surface as a raw EPERM from
+    // rename, and `enable` cannot remove it either, so the error names the path.
+    throw killSwitchPathError("write", file, error);
+  }
+  return { ...record, path: file };
+}
+
+export function clearDisabledFlag() {
+  const file = resolveDisabledFlagPath();
+  try {
+    fs.unlinkSync(file);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw killSwitchPathError("remove", file, error);
+  }
+}
+
 /**
  * Where this process keeps its run records, and whether that is the shared location.
  *

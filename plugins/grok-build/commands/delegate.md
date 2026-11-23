@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the Grok Build delegate subagent
-argument-hint: "[--background|--wait] [--write] [--thread <name>] [--json-schema <json>] [--cwd <path>] [--prompt-file <path>] [--prompts-file <path>] [--timeout-ms <ms>] [--max-turns <n>] [--resume|--fresh] [--model <model>] [--effort <low|medium|high|xhigh>] [what Grok should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--write | --connector <name>[,<name>...]] [--thread <name>] [--json-schema <json>] [--cwd <path>] [--prompt-file <path>] [--prompts-file <path>] [--timeout-ms <ms>] [--max-turns <n>] [--resume|--fresh] [--model <model>] [--effort <low|medium|high|xhigh>] [what Grok should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -16,12 +16,14 @@ Background ownership model (one policy for command, agent, and skill):
 - If the request includes `--wait`, run the subagent in the foreground and do not pass `--background` to `run`.
 - If neither flag is present, default to foreground for a small, clearly bounded request; for complicated or long work, prefer background and pass bridge `--background`.
 - `--wait` is Claude-side only (foreground vs enqueue). Do not treat it as task text. `--background` is a bridge flag when long work is chosen — forward it to `run`, and do not leave it in the natural-language task text.
-- `--model`, `--effort`, `--write`, `--thread`, `--json-schema`, `--cwd`, `--prompt-file`, `--prompts-file`, `--timeout-ms`, and `--max-turns` are runtime controls. Preserve them for the forwarded `run` call; do not treat them as task text.
+- `--model`, `--effort`, `--write`, `--connector`, `--thread`, `--json-schema`, `--cwd`, `--prompt-file`, `--prompts-file`, `--timeout-ms`, and `--max-turns` are runtime controls. Preserve them for the forwarded `run` call; do not treat them as task text.
 - Mutual exclusions the bridge enforces: `--resume`/`--resume-last` vs `--fresh`; `--thread` vs `--resume-last`. If both `--background` and `--wait` appear, treat as wait/foreground.
 - `--prompts-file` is a sequential NDJSON batch on the bridge `run` path; it cannot be combined with `--background`, `--prompt-file`, or a positional prompt.
+- `--connector <name>[,<name>...]` lets the run use the named Grok-side connectors (for example `google_calendar`); the login stays inside the Grok CLI. It is a runtime control like the ones above. A connector request always runs in the foreground: do not add `--background`, and do not combine it with `--write` or `--prompts-file` — the bridge refuses all three.
 
 Execution mode:
 
+- If the request includes `--connector`, run the `grok-build:grok-delegate` subagent in the foreground and drop `--background` if it was given: the bridge refuses connector runs in the background. This rule wins over the next one.
 - If the request includes `--background`, run the `grok-build:grok-delegate` subagent for a short enqueue only, with bridge `--background` on the `run` call.
 - If the request includes `--wait`, run the `grok-build:grok-delegate` subagent in the foreground.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.

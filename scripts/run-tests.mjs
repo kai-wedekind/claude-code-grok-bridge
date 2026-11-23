@@ -16,6 +16,7 @@
  * `npm test -- --test-name-pattern=auth` still works.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
@@ -57,9 +58,30 @@ if (toolList.status !== 0) {
   process.exit(toolList.status ?? 1);
 }
 
+// The kill switch lives under the user's home; the suite must never read or write the real one
+// (a disabled bridge on the developer's machine would fail every run test, and the disable tests
+// would switch it off). Individual tests still set their own path; this is the backstop.
+const disabledFlag = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "grok-cc-suite-")), "disabled.json");
+
+// The runner builds this env itself, so a delete inside a test file cannot see a variable
+// that was copied in here. Drop both plugin-data names, including a differently cased key:
+// a spread of process.env is a plain object, and on Windows the live name is not always the
+// spelling delete would guess (upstream #52, 2026-10-24). The bridge's own child marker and
+// forwarded session id go too: inherited inside a bridge-started Grok session, the marker made
+// every hook test exit at once (11 failures, measured 2026-10-24). So does the update-check
+// opt-out: set in the shell that runs acceptance, it silenced the notice the version-check tests
+// assert on (1 failure, measured 2026-11-22); the opt-out tests set it themselves.
+const suiteEnv = { ...process.env, GROK_CC_DISABLED_FLAG: disabledFlag };
+for (const key of Object.keys(suiteEnv)) {
+  if (/^(CLAUDE_PLUGIN_DATA|GROK_BUILD_PLUGIN_DATA|GROK_CC_BRIDGE_CHILD|GROK_CC_SESSION_ID|GROK_CC_UPDATE_CHECK)$/i.test(key)) {
+    delete suiteEnv[key];
+  }
+}
+
 const result = spawnSync(process.execPath, ["--test", ...process.argv.slice(2), ...files], {
   cwd: ROOT,
-  stdio: "inherit"
+  stdio: "inherit",
+  env: suiteEnv
 });
 
 if (result.error) {

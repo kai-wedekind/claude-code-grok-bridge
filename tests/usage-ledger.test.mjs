@@ -211,3 +211,195 @@ test("render states that the number is spend, not remaining quota", () => {
   assert.match(rendered, /Unsupported side channel/);
   assert.match(rendered, /measures spend, not the remaining weekly allowance/);
 });
+
+test("a monthly period that started 14 days ago counts the runs inside it", () => {
+  // Without start, the window is [end - 7d, end]. An end 16 days ahead puts that
+  // window entirely in the future, so a run from yesterday counted as $0.
+  const home = makeTempDir();
+  const stateRoot = makeTempDir();
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  const start = new Date(now - 14 * day).toISOString();
+  const end = new Date(now + 16 * day).toISOString();
+  writeBillingLog(home, [{
+    ts: new Date(now - 60 * 60 * 1000).toISOString(),
+    lvl: "info",
+    msg: "billing: fetched credits config",
+    ctx: {
+      subscriptionTier: "SuperGrok",
+      config: {
+        creditUsagePercent: 13.37,
+        currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY", start, end }
+      }
+    }
+  }]);
+  writeJob(stateRoot, "ws", "inside", {
+    updatedAt: new Date(now - day).toISOString(),
+    costTicks: 2_000_000_000,
+    usage: { total_tokens: 10 }
+  });
+  writeJob(stateRoot, "ws", "before", {
+    updatedAt: new Date(now - 20 * day).toISOString(),
+    costTicks: 9_000_000_000,
+    usage: { total_tokens: 10 }
+  });
+
+  const report = collectUsage({ stateRoot, home, days: 30 });
+  assert.equal(report.period.kind, "monthly");
+  assert.equal(report.period.runs, 1);
+  assert.equal(report.period.costUsd, 0.2);
+  assert.match(renderUsage(report), /monthly allowance/);
+});
+
+test("a stale monthly period rolls forward by its own length", () => {
+  const home = makeTempDir();
+  const stateRoot = makeTempDir();
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  writeBillingLog(home, [{
+    ts: new Date(now - 60 * 60 * 1000).toISOString(),
+    msg: "creditUsagePercent",
+    ctx: {
+      config: {
+        creditUsagePercent: 10,
+        currentPeriod: {
+          type: "USAGE_PERIOD_TYPE_MONTHLY",
+          start: new Date(now - 40 * day).toISOString(),
+          end: new Date(now - 10 * day).toISOString()
+        }
+      }
+    }
+  }]);
+  writeJob(stateRoot, "ws", "recent", {
+    updatedAt: new Date(now - 5 * day).toISOString(),
+    costTicks: 1_000_000_000,
+    usage: { total_tokens: 1 }
+  });
+
+  const report = collectUsage({ stateRoot, home, days: 7 });
+  assert.equal(report.period.kind, "monthly");
+  assert.equal(report.period.runs, 1, "a 7-day roll leaves this run outside the window");
+  assert.equal(report.period.rolledForward, true);
+});
+
+// The test above stamps its run 5 days
+// ago, which a 7-day roll also counts, because the 30-day window it lands on is wide enough
+// either way. A run 20 days ago is what separates them: the monthly window rolled by its own
+// length starts 10 days ago and excludes it, one rolled by 7 days starts 26 days ago and
+// includes it.
+test("a stale monthly period leaves out a run that predates the rolled window", () => {
+  const home = makeTempDir();
+  const stateRoot = makeTempDir();
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  writeBillingLog(home, [{
+    ts: new Date(now - 60 * 60 * 1000).toISOString(),
+    msg: "creditUsagePercent",
+    ctx: {
+      config: {
+        creditUsagePercent: 10,
+        currentPeriod: {
+          type: "USAGE_PERIOD_TYPE_MONTHLY",
+          start: new Date(now - 40 * day).toISOString(),
+          end: new Date(now - 10 * day).toISOString()
+        }
+      }
+    }
+  }]);
+  writeJob(stateRoot, "ws", "recent", {
+    updatedAt: new Date(now - 5 * day).toISOString(),
+    costTicks: 1_000_000_000,
+    usage: { total_tokens: 1 }
+  });
+  writeJob(stateRoot, "ws", "previous-period", {
+    updatedAt: new Date(now - 20 * day).toISOString(),
+    costTicks: 9_000_000_000,
+    usage: { total_tokens: 1 }
+  });
+
+  const report = collectUsage({ stateRoot, home, days: 7 });
+  assert.equal(report.period.kind, "monthly");
+  assert.equal(report.period.rolledForward, true);
+  assert.equal(report.period.runs, 1, "the run from 20 days ago belongs to the previous period");
+  assert.equal(report.period.costUsd, 0.1);
+  assert.equal(Date.parse(report.period.start), Date.parse(new Date(now - 10 * day).toISOString()));
+});
+
+test("start and type survive in the subscription cache", () => {
+  const home = makeTempDir();
+  const stateRoot = makeTempDir();
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  const start = new Date(now - 14 * day).toISOString();
+  const end = new Date(now + 16 * day).toISOString();
+  writeBillingLog(home, [{
+    ts: new Date(now).toISOString(),
+    msg: "creditUsagePercent",
+    ctx: {
+      config: {
+        creditUsagePercent: 13.37,
+        currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY", start, end }
+      }
+    }
+  }]);
+  readSubscriptionUsage({ home, stateRoot });
+  writeBillingLog(home, ["{}"]);
+
+  const cached = readSubscriptionUsage({ home, stateRoot });
+  assert.equal(cached.cached, true);
+  assert.equal(cached.periodStart, start);
+  assert.equal(cached.periodType, "USAGE_PERIOD_TYPE_MONTHLY");
+  assert.equal(collectUsage({ stateRoot, home }).period.kind, "monthly");
+});
+
+test("the billing log is read from GROK_HOME", () => {
+  const grokHome = makeTempDir();
+  const stateRoot = makeTempDir();
+  const end = new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString();
+  fs.mkdirSync(path.join(grokHome, "logs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(grokHome, "logs", "unified.jsonl"),
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      msg: "creditUsagePercent",
+      ctx: {
+        subscriptionTier: "X Premium+",
+        config: {
+          creditUsagePercent: 13.37,
+          currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end }
+        }
+      }
+    })
+  );
+
+  const reading = readSubscriptionUsage({ env: { GROK_HOME: grokHome }, stateRoot });
+  assert.equal(reading.percentUsed, 13.37);
+  assert.equal(reading.periodEnd, end);
+  assert.equal(reading.cached, false);
+});
+
+test("a log that cannot be opened reports the cache with its age", () => {
+  const home = makeTempDir();
+  const stateRoot = makeTempDir();
+  writeBillingLog(home, [billingLine(42, new Date().toISOString())]);
+  assert.equal(readSubscriptionUsage({ home, stateRoot }).cached, false);
+
+  // The rotation fallback already marks a cache hit when the file opens and holds
+  // no billing line. This path is the one that throws: a log path that cannot be
+  // opened.
+  const report = collectUsage({
+    home,
+    stateRoot,
+    logFile: path.join(home, "missing", "unified.jsonl")
+  });
+  assert.equal(report.subscription.cached, true);
+  assert.equal(typeof report.subscription.ageHours, "number");
+  assert.doesNotMatch(renderUsage(report), /unknown age/);
+  assert.match(renderUsage(report), /from the last reading the log still had/);
+});
+
+test("the usage report says side-model calls are outside the ledger", () => {
+  const rendered = renderUsage(collectUsage({ stateRoot: makeTempDir(), home: makeTempDir() }));
+  assert.match(rendered, /Compaction, memory capture and memory/);
+  assert.match(rendered, /never appear in the per-run envelope/);
+});

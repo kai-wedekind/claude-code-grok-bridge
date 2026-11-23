@@ -5,6 +5,7 @@ import process from "node:process";
 import { JOB_LIVE_STALE_MS } from "./job-control.mjs";
 import { isProcessGone } from "./process.mjs";
 import { describeStateRootOrigin, resolveStateRoot } from "./state.mjs";
+import { resolveGrokHome } from "./subagents.mjs";
 import { resolveJobKillTargets } from "./tracked-jobs.mjs";
 
 /**
@@ -142,7 +143,8 @@ function readJobRecords(workspaceDir) {
  * There is no supported endpoint for this. The official CLI fetches its own billing
  * config at session start and logs the result, so the number can be read back out of
  * that local log. This is an UNSUPPORTED side channel: the field names are not a public
- * contract, the log rotates, and the value is only as fresh as the last CLI session.
+ * contract, the log rotates, and the value is only as fresh as the last interactive CLI
+ * session — headless runs, which is everything this bridge starts, do not write it.
  *
  * Every failure path returns null. Nothing here may throw or block a run — a stale or
  * missing reading must never be able to stop work, which is why this is reported and
@@ -193,10 +195,21 @@ function ageHoursFrom(observedAt) {
   return Number.isFinite(stamp) ? Number(((Date.now() - stamp) / 3_600_000).toFixed(1)) : null;
 }
 
+function billingLogFile(options) {
+  if (options.logFile) {
+    return options.logFile;
+  }
+  // `home` stays <home>/.grok/logs so existing callers keep their fixture layout.
+  // Otherwise follow the CLI: $GROK_HOME/logs, else ~/.grok/logs. GROK_HOME replaces
+  // ~/.grok; it is not a parent of a .grok directory.
+  if (options.home) {
+    return path.join(options.home, ".grok", "logs", "unified.jsonl");
+  }
+  return path.join(resolveGrokHome(options.env), "logs", "unified.jsonl");
+}
+
 export function readSubscriptionUsage(options = {}) {
-  const logFile =
-    options.logFile ??
-    path.join(options.home ?? process.env.USERPROFILE ?? process.env.HOME ?? "", ".grok", "logs", "unified.jsonl");
+  const logFile = billingLogFile(options);
   const stateRoot = options.stateRoot ?? resolveStateRoot();
 
   let text = "";
@@ -212,7 +225,10 @@ export function readSubscriptionUsage(options = {}) {
       fs.closeSync(handle);
     }
   } catch {
-    return readCachedSubscription(stateRoot);
+    // Marked as a cache hit, like the rotation fallback below, so a log that could not be
+    // opened is not rendered as "unknown age".
+    const cached = readCachedSubscription(stateRoot);
+    return cached ? { ...cached, ageHours: ageHoursFrom(cached.observedAt), cached: true } : null;
   }
 
   // Scan backwards: the most recent reading wins.
@@ -237,6 +253,10 @@ export function readSubscriptionUsage(options = {}) {
     const reading = {
       percentUsed: percent,
       periodEnd: config?.currentPeriod?.end ?? null,
+      // Same object the CLI logs. start and type are what make a month a month.
+      // cli-1.0.45 billing.rs:27-39.
+      periodStart: config?.currentPeriod?.start ?? null,
+      periodType: config?.currentPeriod?.type ?? null,
       tier: entry?.ctx?.subscriptionTier ?? null,
       observedAt
     };
@@ -251,6 +271,22 @@ export function readSubscriptionUsage(options = {}) {
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const PERIOD_TYPE_WEEKLY = "USAGE_PERIOD_TYPE_WEEKLY";
+const PERIOD_TYPE_MONTHLY = "USAGE_PERIOD_TYPE_MONTHLY";
+
+/**
+ * credit_bar.rs:398-410: weekly and monthly are named; an unspecified type is "Usage".
+ * The 7-day fallback is a week only because no start was logged.
+ */
+function allowanceKind(periodType, hasOwnLength) {
+  if (periodType === PERIOD_TYPE_MONTHLY) {
+    return "monthly";
+  }
+  if (periodType === PERIOD_TYPE_WEEKLY || !hasOwnLength) {
+    return "weekly";
+  }
+  return "usage";
+}
 
 /**
  * The allowance period this report falls in — not the same seven days as `--days 7`.
@@ -271,11 +307,24 @@ function resolveQuotaPeriod(subscription, nowMs) {
   if (!Number.isFinite(observedEnd)) {
     return null;
   }
+  const observedStart = Date.parse(subscription?.periodStart ?? "");
+  const hasOwnLength = Number.isFinite(observedStart) && observedStart < observedEnd;
+  // A stale boundary repeats. Roll by the period's own length, not by a hard-coded
+  // week: a monthly window rolled by 7 days lands in the wrong month. WEEK_MS is only
+  // the fallback when start was not logged.
+  const length = hasOwnLength ? observedEnd - observedStart : WEEK_MS;
   let end = observedEnd;
+  let start = hasOwnLength ? observedStart : observedEnd - WEEK_MS;
   while (end <= nowMs) {
-    end += WEEK_MS;
+    end += length;
+    start += length;
   }
-  return { startMs: end - WEEK_MS, endMs: end, rolledForward: end !== observedEnd };
+  return {
+    startMs: start,
+    endMs: end,
+    rolledForward: end !== observedEnd,
+    kind: allowanceKind(subscription?.periodType, hasOwnLength)
+  };
 }
 
 export function collectUsage(options = {}) {
@@ -383,7 +432,8 @@ export function collectUsage(options = {}) {
       if (stamp < scanSince) {
         continue;
       }
-      const inPeriod = period ? stamp >= period.startMs : false;
+      // end is exclusive: the roll above treats `end <= now` as the next period's start.
+      const inPeriod = period ? stamp >= period.startMs && stamp < period.endMs : false;
       const inWindow = stamp >= since;
       const usage = job.usage ?? job.result?.usage ?? null;
       const rawTicks = Number.isInteger(job.costTicks) ? job.costTicks : job.result?.costTicks;
@@ -496,6 +546,7 @@ export function collectUsage(options = {}) {
       ? {
           start: new Date(period.startMs).toISOString(),
           end: new Date(period.endMs).toISOString(),
+          kind: period.kind,
           rolledForward: period.rolledForward,
           runs: periodTotals.runs,
           runsWithCost: periodTotals.runsWithCost,
@@ -594,9 +645,15 @@ export function renderUsage(report) {
     const sub = report.subscription;
     const age = sub.ageHours == null ? "unknown age" : `read ${sub.ageHours}h ago`;
     const origin = sub.cached ? ", from the last reading the log still had" : "";
-    const until = sub.periodEnd ? `, weekly period ends ${sub.periodEnd}` : "";
+    const startMs = Date.parse(sub.periodStart ?? "");
+    const endMs = Date.parse(sub.periodEnd ?? "");
+    const kind = allowanceKind(
+      sub.periodType,
+      Number.isFinite(startMs) && Number.isFinite(endMs) && startMs < endMs
+    );
+    const until = sub.periodEnd ? `, ${kind} period ends ${sub.periodEnd}` : "";
     lines.push(
-      `Subscription: ${sub.percentUsed}% of the weekly allowance used (${age}${until}${origin}).`,
+      `Subscription: ${sub.percentUsed}% of the ${kind} allowance used (${age}${until}${origin}).`,
       "  Source: the Grok CLI's own local log. Unsupported side channel, only as fresh as",
       "  the last CLI session — read it as a hint, and confirm on the subscription page.",
       ""
@@ -613,7 +670,12 @@ export function renderUsage(report) {
   lines.push(
     "This is a local ledger of what the CLI reported per run. A Grok subscription",
     "exposes no quota endpoint, so this measures spend, not the remaining weekly allowance;",
-    "calibrate it against the subscription page. Test-fixture runs are excluded.",
+    // cli-1.0.45 docs/user-guide/14-headless-mode.md:168-170: usage sums the prompt and
+    // finished subagents; compaction and other side-model calls are excluded. Memory
+    // capture and Dream consolidation are that class of call.
+    "calibrate it against the subscription page. Compaction, memory capture and memory",
+    "Dream consolidation never appear in the per-run envelope and therefore never in",
+    "this ledger. Test-fixture runs are excluded.",
     ""
   );
   return `${lines.join("\n")}\n`;

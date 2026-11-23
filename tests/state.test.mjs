@@ -8,12 +8,16 @@ import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
 import {
+  clearDisabledFlag,
   loadState,
+  readDisabledFlag,
+  resolveDisabledFlagPath,
   resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
   resolveStateFile,
-  saveState
+  saveState,
+  writeDisabledFlag
 } from "../plugins/grok-build/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
@@ -157,4 +161,202 @@ test("loadState returns default state when the file is missing", () => {
   assert.equal(state.version, 1);
   assert.deepEqual(state.jobs, []);
   assert.deepEqual(state.config, {});
+});
+
+function withEnv(vars, fn) {
+  const previous = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(vars)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+// A plugin data directory AND a private kill-switch flag path, so no test touches the real home.
+function withPluginDataDir(pluginDataDir, fn) {
+  return withEnv(
+    {
+      CLAUDE_PLUGIN_DATA: pluginDataDir,
+      GROK_CC_DISABLED_FLAG: path.join(pluginDataDir, "home", ".grok-cc", "disabled.json")
+    },
+    fn
+  );
+}
+
+test("readDisabledFlag returns null when nothing was ever disabled", () => {
+  withPluginDataDir(makeTempDir(), () => {
+    assert.equal(readDisabledFlag(), null);
+  });
+});
+
+test("writeDisabledFlag then readDisabledFlag round-trips the reason and a timestamp", () => {
+  withPluginDataDir(makeTempDir(), () => {
+    const before = Date.now();
+    const written = writeDisabledFlag("weekly allowance exhausted");
+    assert.equal(written.reason, "weekly allowance exhausted");
+    assert.ok(Date.parse(written.disabledAt) >= before, "disabledAt should be a real, current timestamp");
+
+    const read = readDisabledFlag();
+    assert.equal(read.reason, written.reason);
+    assert.equal(read.disabledAt, written.disabledAt);
+    assert.equal(written.path, resolveDisabledFlagPath(), "disable must say where the flag is");
+  });
+});
+
+test("the flag does not depend on CLAUDE_PLUGIN_DATA: a shell without it and the plugin agree", () => {
+  // A flag in the state root would make `disable` from a shell without the variable write a
+  // file the plugin never reads, and the plugin would keep spending.
+  const flag = path.join(makeTempDir(), ".grok-cc", "disabled.json");
+  withEnv({ GROK_CC_DISABLED_FLAG: flag, CLAUDE_PLUGIN_DATA: undefined }, () => {
+    writeDisabledFlag("allowance exhausted");
+  });
+  withEnv({ GROK_CC_DISABLED_FLAG: flag, CLAUDE_PLUGIN_DATA: makeTempDir() }, () => {
+    assert.equal(readDisabledFlag()?.reason, "allowance exhausted");
+  });
+});
+
+test("a flag under the state root is not the kill switch", () => {
+  // The bridge writes no flag there, and reading one would make `enable` delete a file the
+  // current flag does not own.
+  withPluginDataDir(makeTempDir(), () => {
+    const legacy = path.join(process.env.CLAUDE_PLUGIN_DATA, "state", "disabled.json");
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    fs.writeFileSync(legacy, JSON.stringify({ reason: "old build", disabledAt: "2026-09-06T00:00:00Z" }));
+    assert.equal(readDisabledFlag(), null);
+    assert.equal(clearDisabledFlag(), false);
+    assert.equal(fs.existsSync(legacy), true);
+  });
+});
+
+test("a leading ~/ in GROK_CC_DISABLED_FLAG expands to the home directory", () => {
+  // chdir so an unexpanded `~` (path.resolve against the cwd) cannot land in the repo.
+  const home = makeTempDir();
+  const scratch = makeTempDir();
+  const previousCwd = process.cwd();
+  process.chdir(scratch);
+  try {
+    withEnv(
+      {
+        USERPROFILE: home,
+        HOME: home,
+        GROK_CC_DISABLED_FLAG: "~/ks-flag.json",
+        CLAUDE_PLUGIN_DATA: undefined
+      },
+      () => {
+        const expected = path.join(home, "ks-flag.json");
+        const written = writeDisabledFlag("tilde");
+        assert.equal(path.resolve(written.path), path.resolve(expected));
+        assert.equal(readDisabledFlag()?.reason, "tilde");
+        assert.equal(fs.existsSync(expected), true);
+      }
+    );
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+// Pins the `~` and `~\` branches of expandLeadingHome. Only the
+// resolved path is read, nothing is written, so the temp "home" stays the only path touched.
+test("a bare ~ in GROK_CC_DISABLED_FLAG resolves to the home directory itself", () => {
+  const home = makeTempDir();
+  withEnv({ USERPROFILE: home, HOME: home, GROK_CC_DISABLED_FLAG: "~", CLAUDE_PLUGIN_DATA: undefined }, () => {
+    assert.equal(resolveDisabledFlagPath(), path.resolve(home));
+  });
+});
+
+test("a leading ~\\ in GROK_CC_DISABLED_FLAG expands to the home directory", () => {
+  const home = makeTempDir();
+  withEnv(
+    { USERPROFILE: home, HOME: home, GROK_CC_DISABLED_FLAG: "~\\ks-flag.json", CLAUDE_PLUGIN_DATA: undefined },
+    () => {
+      assert.equal(resolveDisabledFlagPath(), path.resolve(path.join(home, "ks-flag.json")));
+    }
+  );
+});
+
+test("a relative GROK_CC_DISABLED_FLAG fails closed and is not resolved against the cwd", () => {
+  const scratch = makeTempDir();
+  const previousCwd = process.cwd();
+  process.chdir(scratch);
+  const relative = "rel/disabled.json";
+  try {
+    withEnv({ GROK_CC_DISABLED_FLAG: relative, CLAUDE_PLUGIN_DATA: undefined }, () => {
+      const flag = readDisabledFlag();
+      assert.equal(flag?.disabledAt, "unknown");
+      assert.match(flag?.reason ?? "", /GROK_CC_DISABLED_FLAG must be an absolute path/);
+      assert.match(flag?.reason ?? "", /rel\/disabled\.json/);
+      assert.throws(
+        () => writeDisabledFlag("nope"),
+        (error) => {
+          assert.equal(error.message, flag.reason);
+          return true;
+        }
+      );
+      assert.throws(() => clearDisabledFlag(), (error) => {
+        assert.equal(error.message, flag.reason);
+        return true;
+      });
+    });
+    assert.equal(fs.existsSync(path.join(scratch, "rel", "disabled.json")), false);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test("an absolute GROK_CC_DISABLED_FLAG is used as given", () => {
+  const flag = path.join(makeTempDir(), "disabled.json");
+  withEnv({ GROK_CC_DISABLED_FLAG: flag }, () => {
+    assert.equal(resolveDisabledFlagPath(), path.resolve(flag));
+    writeDisabledFlag("absolute");
+    assert.equal(readDisabledFlag()?.reason, "absolute");
+    assert.equal(clearDisabledFlag(), true);
+    assert.equal(readDisabledFlag(), null);
+  });
+});
+
+test("a flag file of the wrong shape, or one that cannot be read, fails CLOSED", () => {
+  for (const content of ["{}", JSON.stringify({ reason: "only a reason" }), "null", "[]"]) {
+    withPluginDataDir(makeTempDir(), () => {
+      const flagPath = resolveDisabledFlagPath();
+      fs.mkdirSync(path.dirname(flagPath), { recursive: true });
+      fs.writeFileSync(flagPath, content);
+      assert.match(readDisabledFlag()?.reason ?? "", /not a valid flag record/, content);
+    });
+  }
+  withPluginDataDir(makeTempDir(), () => {
+    // A directory where the file should be: readable as neither, so it must count as disabled.
+    fs.mkdirSync(resolveDisabledFlagPath(), { recursive: true });
+    assert.match(readDisabledFlag()?.reason ?? "", /could not be read/);
+  });
+});
+
+test("clearDisabledFlag removes the flag and reports whether one existed", () => {
+  withPluginDataDir(makeTempDir(), () => {
+    assert.equal(clearDisabledFlag(), false, "nothing to clear yet");
+    writeDisabledFlag("test");
+    assert.equal(clearDisabledFlag(), true, "a flag existed and was removed");
+    assert.equal(readDisabledFlag(), null);
+    assert.equal(clearDisabledFlag(), false, "clearing twice is not an error");
+  });
+});
+
+test("a corrupted disabled-flag file fails CLOSED, not open", () => {
+  // ⚠ The one case worth its own test: an unparseable flag file must read as disabled, never
+  // as "not disabled" — a half-written or corrupted file must not silently re-enable spending.
+  withPluginDataDir(makeTempDir(), () => {
+    const flagPath = resolveDisabledFlagPath();
+    fs.mkdirSync(path.dirname(flagPath), { recursive: true });
+    fs.writeFileSync(flagPath, "{ not valid json");
+
+    const flag = readDisabledFlag();
+    assert.ok(flag, "a corrupt flag file must still read as disabled");
+    assert.match(flag.reason, /could not be parsed/i);
+  });
 });

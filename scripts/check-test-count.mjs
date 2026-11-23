@@ -119,6 +119,32 @@ if (actual === 0) {
 // CHANGELOG entries for OLD releases are deliberately not touched: "429 unit tests" in the
 // 0.3.2 notes is a record of what was true then, not a claim about now. Only the topmost
 // release section is checked, because that is the one being written.
+//
+// ⚠ AND ONLY WHILE IT IS BEING WRITTEN. Between releases the topmost section IS the last
+// published one, and this gate's own `--write` advice would then rewrite its "Verified" count
+// — a published record silently falsified by the check meant to keep counts honest. A section
+// whose version already has a `v<version>` tag is released and is skipped; assemble the next
+// release's section first, then run this.
+//
+// A failed tag lookup must not count as "not released", or `--write` would rewrite the
+// published section whenever git could not be asked. A checkout with no tags at
+// all does the same — every section looks unreleased — and that is not an all-clear either.
+function isReleased(version) {
+  const tags = spawnSync("git", ["-C", ROOT, "tag", "-l"], { encoding: "utf8" });
+  if (tags.error || tags.status !== 0) {
+    const why = tags.error ? tags.error.message : `git exited ${tags.status}`;
+    fail(2, `Could not ask git whether ${version} is already released (${why}). This is NOT an all-clear.`);
+  }
+  const names = tags.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (names.length === 0) {
+    fail(
+      2,
+      `Could not ask git whether ${version} is already released: this checkout has no tags, so a released section cannot be told from an unreleased one. This is NOT an all-clear.`
+    );
+  }
+  return names.includes(`v${version}`);
+}
+
 const TARGETS = [
   { label: "README.md", file: README, scope: (text) => ({ start: 0, end: text.length }) },
   {
@@ -127,6 +153,11 @@ const TARGETS = [
     scope: (text) => {
       const first = text.indexOf("## [");
       if (first === -1) return null;
+      const version = /^## \[([^\]]+)\]/.exec(text.slice(first))?.[1];
+      if (version && isReleased(version)) {
+        console.log(`CHANGELOG.md: topmost section ${version} is already released (tag v${version}); not checked`);
+        return null;
+      }
       const next = text.indexOf("## [", first + 4);
       return { start: first, end: next === -1 ? text.length : next };
     }

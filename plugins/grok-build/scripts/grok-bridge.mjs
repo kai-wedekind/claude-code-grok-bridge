@@ -3,6 +3,7 @@
 // Apache-2.0 section 4(b) notice; see NOTICE and CHANGELOG.md for what changed.
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -48,6 +49,7 @@ import {
   claimJobTerminal,
   cleanTerminalJobs,
   assertValidSessionId,
+  clearDisabledFlag,
   deleteNamedThread,
   generateJobId,
   getNamedThread,
@@ -55,11 +57,13 @@ import {
   setNamedThread,
   describeStateRootOrigin,
   listJobs,
+  readDisabledFlag,
   patchJobIfActive,
   resolveJobLogFile,
   resolveTrustedJobLogFile,
   resolveStateRoot,
   upsertJob,
+  writeDisabledFlag,
   writeFileAtomic,
   writeJobFile
 } from "./lib/state.mjs";
@@ -89,6 +93,7 @@ import {
   validateReviewResultShape
 } from "./lib/render.mjs";
 import { collectSubagentEvidence } from "./lib/subagents.mjs";
+import { assessConnectorRun } from "./lib/connector-evidence.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
@@ -143,7 +148,13 @@ const MAX_JSON_SCHEMA_CHARS = 16000;
  * somebody logs in. Everything else keeps the CLI's own status, because a caller may
  * legitimately retry it.
  */
-const RETRY_CANNOT_HELP = new Set(["quota-exhausted", "not-authenticated"]);
+const RETRY_CANNOT_HELP = new Set([
+  "quota-exhausted",
+  "not-authenticated",
+  "connector-refused",
+  // Same request, same --max-turns, same stop. The partial text is already kept.
+  "max-turns"
+]);
 
 function printUsage() {
   console.log(
@@ -153,12 +164,14 @@ function printUsage() {
       "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [focus text]",
       "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [focus text]",
       "  node scripts/grok-bridge.mjs usage [--days <n>] [--include-test-workspaces] [--json]",
-      "  node scripts/grok-bridge.mjs run [--background] [--write] [--thread <name>] [--json-schema <json>] [--prompt-file <path>] [--prompts-file <path>] [--resume-last|--resume|--fresh (default)] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [prompt]",
+      "  node scripts/grok-bridge.mjs run [--background] [--write | --connector <name>[,<name>...]] [--thread <name>] [--json-schema <json>] [--prompt-file <path>] [--prompts-file <path>] [--resume-last|--resume|--fresh (default)] [--model <model>] [--effort <low|medium|high|xhigh>] [--timeout-ms <ms>] [--max-turns <n>] [prompt]",
       "  node scripts/grok-bridge.mjs runs [run-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--all] [--all-sessions] [--json]",
       "  node scripts/grok-bridge.mjs show [run-id] [--wait] [--strands] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
       "  node scripts/grok-bridge.mjs stop [run-id] [--json]",
       "  node scripts/grok-bridge.mjs threads [--forget <name>] [--json]",
       "  node scripts/grok-bridge.mjs clean [--keep <n>] [--older-than-ms <ms>] [--json]",
+      '  node scripts/grok-bridge.mjs disable --reason "<why>" [--json]',
+      "  node scripts/grok-bridge.mjs enable [--json]",
       "",
       // --cwd and --json are accepted almost everywhere and were previously discoverable
       // only from an error message or the README; repeating them on every line above
@@ -393,8 +406,11 @@ async function buildCheckReport(cwd, actionsTaken = []) {
   return {
     // ⚠ `ready` stays node + grok + auth. Version state is reported separately and
     // deliberately does NOT fold in here: `--verify-tools` already overloads exit 1 and 2, and
-    // being three releases behind is not the same kind of fact as "the CLI is missing".
+    // being three releases behind is not the same kind of fact as "the CLI is missing", and
+    // neither is the disable flag below — a disabled bridge can be perfectly ready to run the
+    // moment it is re-enabled, which `ready` should still say plainly.
     ready: nodeStatus.available && grokStatus.available && authStatus.loggedIn,
+    disabled: readDisabledFlag(),
     node: nodeStatus,
     grok: grokStatus,
     auth: authStatus,
@@ -502,14 +518,19 @@ function verifyDisallowedToolIds(cwd) {
     // ⚠ The same flags a real read-only run uses, not a minimal subset. A probe that spawns a
     // DIFFERENT session from the one we ship can only answer for the session it spawned — and
     // the requirement graph, which is the thing that killed us, is a property of the whole flag
-    // set. `--no-plan` in particular is not decoration: plan mode dead-ends headless.
+    // set. `--no-plan` is still passed and a headless run ignores it: the only consumer is
+    // the TUI (event_loop.rs:1116); HeadlessOptions has no plan field (headless.rs:53-95).
+    // Harmless TUI parity.
     const result = runGrok(
       [
         "-p",
         "Reply with the single word OK.",
         "--no-plan",
         "--sandbox",
-        "read-only",
+        // The same profile every other read-only launch passes.
+        // On a Linux kernel without Landlock, `read-only` is the profile current CLIs
+        // refuse to start (config/mod.rs:1489-1495).
+        readOnlySandboxProfile(),
         "--disallowed-tools",
         [...READ_ONLY_DISALLOWED_TOOLS, TOOL_ID_PROBE_CONTROL].join(","),
         ...READ_ONLY_DENY_RULES.flatMap((rule) => ["--deny", rule]),
@@ -619,7 +640,22 @@ async function handleCheck(argv) {
     };
   }
   if (options["verify-tools"]) {
-    finalReport.toolIds = verifyDisallowedToolIds(cwd);
+    // ⚠ Checked here rather than via assertBridgeEnabled(), and deliberately not thrown.
+    // `--verify-tools` is an add-on to `check`, not a command of its own — throwing would
+    // discard the node/grok/auth/version report along with it, the one thing `check` exists
+    // to show while disabled. So this starts no process at all and reports the same
+    // "could not check" shape verifyDisallowedToolIds itself uses on failure, which the
+    // renderer already treats as exit 2 below — a real finding about the removal list and
+    // "the bridge would not even ask" must not share an exit code with each other.
+    const disabledFlag = readDisabledFlag();
+    finalReport.toolIds = disabledFlag
+      ? {
+          checked: false,
+          total: READ_ONLY_DISALLOWED_TOOLS.length,
+          unmatched: [],
+          error: `Grok Build is disabled: ${disabledFlag.reason} — verify-tools needs a real CLI session and none will run`
+        }
+      : verifyDisallowedToolIds(cwd);
     // ⚠ The verdict has to reach the EXIT CODE, not only the text. A check that prints
     // "3 of 14 MATCH NOTHING" and then exits 0 is read as success by everything that does not
     // have eyes — CI, a shell `&&`, a release script — which is the precise false-green shape
@@ -671,9 +707,11 @@ function isActiveJobStatus(status) {
 /**
  * True when this run's spend was never accounted for.
  *
- * `usage_is_incomplete` only ever arrives inside the CLI's final envelope, and a process
- * killed by the wall-clock timeout never gets to send one. The record then claimed full
- * accounting for a run that produced no accounting at all, and the ledger — which skips
+ * `usage_is_incomplete` arrives on the CLI's final envelope and, on a fatal error, on the
+ * spend projection attached at the top level of that error object (headless.rs:351-359).
+ * A process killed by the wall-clock timeout never gets to send
+ * either. The record then claimed full accounting for a run that produced no accounting
+ * at all, and the ledger — which skips
  * jobs with no usage, no cost and no incomplete flag — dropped it without a word. Tokens
  * that were really spent simply vanished from the week's total instead of showing up as
  * unknown. Measured 2026-07-28: a run killed by a 20s timeout moved the ledger by nothing
@@ -716,6 +754,14 @@ function addTurns(a, b) {
   return Number.isInteger(b) ? a + b : a;
 }
 
+function launchHasUsageWithoutCost(result) {
+  return Boolean(result?.usage) && !Number.isInteger(result?.costTicks) && typeof result?.costUsd !== "number";
+}
+
+function launchReportedCost(result) {
+  return Number.isInteger(result?.costTicks) || typeof result?.costUsd === "number";
+}
+
 function usageUnaccounted(result, failureCode) {
   if (result.usageIncomplete === true) {
     return true;
@@ -755,8 +801,27 @@ function findLatestResumableTaskJob(jobs) {
   );
 }
 
+// Missing means the default. `0` is a real wait: check once, do not sit for four minutes.
+// A negative or non-finite value is a usage error. `Number("0") || default` would turn both
+// `0` and a typo into DEFAULT_STATUS_WAIT_TIMEOUT_MS (upstream #57).
+// This is only the `runs`/`show --wait` clock. The run wall-clock flag stays on parsePositiveInt.
+function parseDurationOption(name, raw, defaultMs) {
+  if (raw === undefined || raw === null || raw === "") {
+    return defaultMs;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(
+      `--${name} must be a non-negative number of milliseconds, got ${JSON.stringify(String(raw))}.`
+    );
+  }
+  return Math.floor(parsed);
+}
+
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
-  const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  const timeoutMs = parseDurationOption("timeout-ms", options.timeoutMs, DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  // The 100ms floor stays. `0` and a non-numeric interval still mean the default poll;
+  // only --timeout-ms treats 0 as check-once and rejects a bad value (upstream #57).
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
   let snapshot = buildSingleJobSnapshot(cwd, reference);
@@ -840,45 +905,78 @@ async function executeReviewRun(request) {
     });
   }
 
-  const result = await runHeadlessAgent(context.repoRoot, {
-    prompt,
-    agent: "explore",
-    // Same read-only regime as the task path: real tool removal + deny rules instead
-    // of interactive plan mode, which dead-ends headless — and, since 2026-08-09, the same
-    // disclosure, computed here so both return paths carry it. `review` is never a write run.
-    noPlan: true,
-    sandbox: "read-only",
-    disallowedTools: READ_ONLY_DISALLOWED_TOOLS,
-    denyRules: READ_ONLY_DENY_RULES,
-    model: request.model,
-    effort: request.effort,
-    maxTurns: request.maxTurns ?? undefined,
-    timeoutMs: request.timeoutMs ?? undefined,
-    // JSON on both branches, and the plain one is the point. `plain` produced no CLI
-    // envelope, so `result.usage` was always null, so the ledger's "skip records with no
-    // usage, no cost and no ticks" rule dropped every successful review — silently, and
-    // without the incomplete marker that exists precisely to make an unmeasured run
-    // visible. Every review anyone has ever run is missing from the spend history, and a
-    // week's calibration was built on the remainder.
-    //
-    // What carries the fix is the envelope branch: a real CLI envelope yields
-    // `envelope.text` as the review and `envelope.usage` as the spend, which is everything
-    // the ledger needs.
-    //
-    // The non-envelope fallback is close to the old behaviour but NOT identical, and the
-    // first version of this comment claimed it was — an independent verification caught
-    // the overstatement. Precisely: output that is not an envelope but whose last JSON
-    // object carries a string `text` field yields that field rather than raw stdout,
-    // because `envelopeHasText` is tested before `isEnvelope`. That is deliberate and
-    // predates this change (see the `bare-text-object` and `text-plus-usage-object`
-    // fixtures) — it simply is not "exactly what plain did". Two further differences: a
-    // real envelope without text now counts as no deliverable rather than the raw JSON
-    // becoming the review, which is what the task path has always done, and envelope text
-    // is not trimEnd'ed the way raw stdout is.
-    outputFormat: "json",
-    jsonSchema: structured ? readOutputSchema(REVIEW_SCHEMA) : undefined,
-    onProgress: request.onProgress
+  // Acquire the slot first, then re-check, and pass the slot down. A check made here before
+  // runHeadlessAgent waited for its own slot would let a review or critique already queued when
+  // `disable` landed still start a session, foreground and background alike. Collecting the
+  // context can also take a while.
+  const slot = await acquireGlobalSlot({
+    onWait: (maxSlots) =>
+      request.onProgress?.({
+        message: `Waiting for a free Grok slot (max ${maxSlots} machine-wide).`,
+        phase: "queued"
+      }),
+    onOverflow: (maxSlots) =>
+      request.onProgress?.({
+        message: `Queue wait exhausted (max ${maxSlots} machine-wide); starting anyway rather than failing the run.`,
+        phase: "starting"
+      })
   });
+  try {
+    assertBridgeEnabled();
+  } catch (error) {
+    try {
+      slot.release();
+    } catch {
+    }
+    throw error;
+  }
+  let result;
+  try {
+    result = await runHeadlessAgent(context.repoRoot, {
+      prompt,
+      agent: "explore",
+      // Same read-only regime as the task path: tool removal and deny rules. `--no-plan`
+      // is still passed and a headless run ignores it. Since 2026-08-09 the same disclosure,
+      // computed here so both return paths carry it. `review` is never a write run.
+      noPlan: true,
+      sandbox: readOnlySandboxProfile(),
+      disallowedTools: READ_ONLY_DISALLOWED_TOOLS,
+      denyRules: READ_ONLY_DENY_RULES,
+      model: request.model,
+      effort: request.effort,
+      maxTurns: request.maxTurns ?? undefined,
+      timeoutMs: request.timeoutMs ?? undefined,
+      // JSON on both branches, and the plain one is the point. `plain` produced no CLI
+      // envelope, so `result.usage` was always null, so the ledger's "skip records with no
+      // usage, no cost and no ticks" rule dropped every successful review — silently, and
+      // without the incomplete marker that exists precisely to make an unmeasured run
+      // visible.
+      //
+      // What carries the fix is the envelope branch: a real CLI envelope yields
+      // `envelope.text` as the review and `envelope.usage` as the spend, which is everything
+      // the ledger needs.
+      //
+      // The non-envelope fallback is close to the old behaviour but NOT identical. Precisely:
+      // output that is not an envelope but whose last JSON object carries a string `text` field
+      // yields that field rather than raw stdout,
+      // because `envelopeHasText` is tested before `isEnvelope`. That is deliberate and
+      // predates this change (see the `bare-text-object` and `text-plus-usage-object`
+      // fixtures) — it simply is not "exactly what plain did". Two further differences: a
+      // real envelope without text now counts as no deliverable rather than the raw JSON
+      // becoming the review, which is what the task path has always done, and envelope text
+      // is not trimEnd'ed the way raw stdout is.
+      outputFormat: "json",
+      jsonSchema: structured ? readOutputSchema(REVIEW_SCHEMA) : undefined,
+      // Caller-owned: runHeadlessAgent must not wait again or release this slot.
+      slot,
+      onProgress: request.onProgress
+    });
+  } finally {
+    try {
+      slot.release();
+    } catch {
+    }
+  }
 
   if (structured) {
     // Prefer the CLI's structuredOutput (same as the task path) so an envelope with
@@ -1225,15 +1323,135 @@ const TOOL_ID_PROBE_CONTROL = "grok_cc_probe_control_not_a_tool";
 // (e.g. by a subagent or a future default-tool change).
 const READ_ONLY_DENY_RULES = ["Bash", "Write", "Edit", "MCPTool"];
 
+// Connector mode (`run --connector <name>[,<name>…]`): the read-only regime with exactly one
+// opening, so the model can reach the xAI managed gateway connectors the caller names (e.g.
+// google_calendar, notion) that the user signed in to in the CLI or on grok.com, while the
+// credential stays inside the grok process. The bridge never sees it.
+//
+// Derived by subtraction, never copied, so an id added to the read-only lists later is removed
+// here too. Everything else stays: the shell, file writes, media generation, web_fetch, the
+// scheduler, the Bash/Write/Edit deny rules and the same --sandbox profile as every other
+// read-only launch (`off` when this Linux kernel has no Landlock). `--no-plan` is still
+// passed and is not part of the barrier: a headless run ignores it.
+const CONNECTOR_KEPT_TOOLS = ["search_tool", "use_tool"];
+const CONNECTOR_DISALLOWED_TOOLS = READ_ONLY_DISALLOWED_TOOLS.filter(
+  (id) => !CONNECTOR_KEPT_TOOLS.includes(id)
+);
+const CONNECTOR_DENY_RULES = READ_ONLY_DENY_RULES.filter((rule) => rule !== "MCPTool");
+// A gateway connector name as the CLI qualifies its tools (`<server>__<tool>`): either a whole
+// connector (`google_calendar`) or one exact tool of it (`google_calendar__search`), so a read
+// task can be limited mechanically to read tools. Each part uses single separators only, so `__`
+// appears at most once and only between server and tool, and `*` is never accepted — it would
+// widen the allow rule to every connector. There is deliberately no "all": naming each connector
+// is what keeps a calendar task from also being able to send mail.
+const CONNECTOR_NAME_PART = "[a-z0-9]+(?:[_-][a-z0-9]+)*";
+const CONNECTOR_NAME_PATTERN = new RegExp(`^${CONNECTOR_NAME_PART}(?:__${CONNECTOR_NAME_PART})?$`);
+// grok 1.0.41 resolves `managed_mcps.enabled` to `!is_headless` when nothing sets it, so a
+// headless process never fetches the gateway catalog unless told to (config/mod.rs,
+// ManagedMcpsConfig::resolve). Both are set so the run does not depend on the remote default
+// for the second one. Measured 2026-09-23: with these set the catalog arrives, 178 tools.
+const CONNECTOR_CHILD_ENV = {
+  GROK_MANAGED_MCPS_ENABLED: "true",
+  GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED: "true"
+};
+
+// The allow rules are the gate: with --permission-mode default a headless run answers every
+// permission request with Cancelled (xai-grok-pager/src/headless.rs), so only the named
+// connectors' tools are pre-approved and a call to any other connector is refused. The mode has
+// to be pinned on the command line; see `permissionMode` in executeTaskRun.
+// ⚠ Additive, not exclusive: the CLI also merges allow rules from ~/.grok/config.toml, managed
+// policy and Claude Code's settings (~/.claude/settings.json always, a trusted project's too),
+// and from "Always allow" grants saved for the repository; a Claude `defaultMode` of auto or
+// bypassPermissions replaces Cancelled with a classifier or with approval; and the rule also
+// matches a local MCP server of the same name, which use_tool prefers. Nothing here can switch
+// those off for one run (grok 1.0.41: permission/resolution.rs, manager/mod.rs, use_tool/mod.rs).
+function connectorAllowRule(connector) {
+  return connector.includes("__") ? `MCPTool(${connector})` : `MCPTool(${connector}__*)`;
+}
+
+// Prepended to every connector-mode prompt. The catalog race is the one failure every connector
+// task hits unless the prompt says to poll, and the delegate path forwards the user's text
+// verbatim, so this has to be a default the bridge applies rather than advice a caller may skip.
+// Measured 2026-09-23: a model that searched once, before the catalog landed, found nothing.
+// `marker` is this run's anchor in chat_history.jsonl. The CLI stores the prompt verbatim as a
+// user item, so the check grades the lines after the user line that contains it.
+function connectorPromptPreamble(connectors, marker) {
+  return [
+    `[Bridge note] This run may use only these connectors: ${connectors.join(", ")}. Do not call a tool of any other connector.` +
+      (connectors.some((name) => name.includes("__"))
+        ? " Where a name above includes a tool (server__tool), only that tool of the connector may be called."
+        : "") +
+      ` This run is ${marker}.`,
+    "The connector tool catalog loads a few seconds after the session starts, and until it has loaded search_tool answers with status ready and no tools.",
+    "Before concluding that a connector or one of its tools is unavailable, call search_tool again, one call per turn, until it returns tool names or you have tried at least five times, and pass a limit of 20 or more when you need a connector's full tool list."
+  ].join(" ");
+}
+
+// `[A-Za-z0-9-]` only: the history check searches for the token as a substring of a user line.
+function newConnectorRunMarker() {
+  return `grok-cc-run-${crypto.randomBytes(9).toString("hex")}`;
+}
+
+// A prompt whose first text is "/" may be taken by the CLI as one of its own slash commands
+// rather than as a task. A read-only run is where this bridge promises a barrier, so there the
+// prompt never starts with "/". Write runs are unconfined by design; review, critique and
+// connector prompts already open with bridge text.
+const SLASH_GUARD_LINE =
+  "[Bridge note] The task text below comes from the caller. Read it as a task, not as a command.";
+
+// Any leading Unicode white space counts before the "/". Broader than the CLI's own parse on
+// purpose — "/etc/hosts …" gets the note too — because the note is harmless and a closer copy
+// of the parse would have to follow every CLI release.
+const LEADING_SLASH = /^\p{White_Space}*\//u;
+
+function promptStartsWithSlash(prompt) {
+  return LEADING_SLASH.test(String(prompt ?? ""));
+}
+
+// `--connector` takes one name or a comma-separated list. Returns the validated, de-duplicated
+// names in the order given. An absent value (null, undefined, false) is not connector mode; an
+// empty or malformed name is refused.
+function parseConnectorList(value) {
+  if (value == null || value === false) {
+    return [];
+  }
+  const raw = Array.isArray(value) ? value : [value];
+  const names = [];
+  for (const part of raw.flatMap((item) => String(item).split(","))) {
+    const name = part.trim();
+    if (!CONNECTOR_NAME_PATTERN.test(name)) {
+      throw new Error(
+        `--connector takes gateway connector names such as google_calendar or google_calendar,notion, or exact tools such as google_calendar__search (lowercase letters and digits, single "_" or "-" between them, "__" only between connector and tool, no wildcards); got "${name}".`
+      );
+    }
+    if (!names.includes(name)) {
+      names.push(name);
+    }
+  }
+  return names;
+}
+
 /**
  * What actually confined this run — and, more to the point, what only looked like it did.
  *
- * `--sandbox read-only` is passed on every read-only run. Whether anything enforces it is a
- * property of the KERNEL, not of the platform name: xAI documents Landlock on Linux and
- * Seatbelt on macOS, and Landlock is a build option that mainstream images ship without. On
- * Windows it is accepted and not enforced — "not enforced" rather than "does nothing", because
- * xAI documents effects that follow from merely requesting a profile, and the public docs were
- * corrected to say so.
+ * `--sandbox read-only` is passed on every read-only run except one. On Linux, when Landlock
+ * is not an active LSM, current CLIs refuse to start rather than run that profile: measured
+ * on grok 1.0.70, 2026-10-24 (stdout empty, exit 1, the refusal sentence on stderr), and the
+ * 1.0.45 source already exits 1 (xai-grok-shell config/mod.rs:1489-1495) because every profile
+ * except `devbox`, `off` and a custom profile that extends `devbox` requires hook write-deny
+ * (hook_write_deny.rs:21-23, xai-grok-sandbox lib.rs:54-66, the custom exemption at lib.rs:60-62).
+ * That exemption does not reach the refusal: its condition is `is_custom || needs_hooks`
+ * (xai-grok-shell src/config/mod.rs:1475-1480), so every custom profile still counts for it.
+ * `ProfileName::Off` skips that branch (config/mod.rs:1473). The bridge passes `--sandbox off`
+ * there, explicitly, so a profile set in the user's own Grok config or GROK_SANDBOX cannot
+ * re-trigger the refusal. A managed requirement outranks the CLI flag
+ * (agent/config.rs:632-643, requirement > CLI > env > config) and can still force a profile.
+ * Whether anything enforces `read-only` where it is still passed is a property of
+ * the KERNEL, not of the platform name: xAI documents Landlock on Linux and Seatbelt on macOS,
+ * and Landlock is a build option that mainstream images ship without. On Windows the flag is
+ * still accepted and not enforced — "not enforced" rather than "does nothing", because xAI
+ * documents effects that follow from merely requesting a profile, and the public docs were
+ * corrected to say so. Measured again on grok 1.0.70, 2026-10-24: the write landed, exit 0.
  *
  * ⚠ This paragraph said "is enforced by the kernel on Linux and macOS" until 2026-08-09, which
  * contradicted the probe twenty lines below it and told anyone reading the surrounding function
@@ -1274,10 +1492,67 @@ const READ_ONLY_DENY_RULES = ["Bash", "Write", "Edit", "MCPTool"];
  * is not accidental — one is shell in a release gate, the other is JS at runtime, and neither
  * can call the other. If the rule changes, both change. Injectable so the three branches are
  * testable on a host that only ever produces one of them.
+ *
+ * GROK_CC_LANDLOCK_PROBE exists for tests. It accepts only `present`, `absent` and
+ * `unknown`; any other value is ignored and the real probe runs. It does not by itself
+ * select `--sandbox off`: that happens only when the platform is linux AND the answer is
+ * absent. GROK_CC_CONFINEMENT_PLATFORM (`linux`, `win32` or `darwin`) is read only while
+ * that probe override is one of the three values, so a test on another host can exercise
+ * the Linux branch. Setting `process.platform` itself would switch the path module and
+ * break the run. A platform value with no recognised probe override does not change a
+ * real run.
+ *
+ * While that override is set, the answer was not measured. The
+ * record does not say `enforced`, and a Linux read-only disclosure says the answer was
+ * forced by GROK_CC_LANDLOCK_PROBE and that the host was not probed. The argv is
+ * unchanged. Write mode never consults the probe, so its disclosure does not claim the
+ * probe decided it.
+ *
+ * Off Linux the probe decides nothing, so a non-Linux record is
+ * annotated only when GROK_CC_CONFINEMENT_PLATFORM decided the platform (recognised value,
+ * probe override set, no explicit platform argument), and then the note names that
+ * variable, not the probe. With no platform override a non-Linux record carries no note.
  */
+const LANDLOCK_PROBE_ENV = "GROK_CC_LANDLOCK_PROBE";
+const CONFINEMENT_PLATFORM_ENV = "GROK_CC_CONFINEMENT_PLATFORM";
+const LANDLOCK_PROBE_VALUES = new Set(["present", "absent", "unknown"]);
+const CONFINEMENT_PLATFORM_VALUES = new Set(["linux", "win32", "darwin"]);
+
+function landlockProbeOverride() {
+  const raw = process.env[LANDLOCK_PROBE_ENV];
+  return LANDLOCK_PROBE_VALUES.has(raw) ? raw : undefined;
+}
+
+// The platform the ENV decided, or undefined. An explicit argument
+// decides first, and the variable counts only while the probe override is set, so a stray
+// variable cannot change a real run.
+function forcedConfinementPlatform(explicit) {
+  if (typeof explicit === "string" && explicit) {
+    return undefined;
+  }
+  if (landlockProbeOverride()) {
+    const forced = process.env[CONFINEMENT_PLATFORM_ENV];
+    if (CONFINEMENT_PLATFORM_VALUES.has(forced)) {
+      return forced;
+    }
+  }
+  return undefined;
+}
+
+function confinementPlatform(explicit) {
+  if (typeof explicit === "string" && explicit) {
+    return explicit;
+  }
+  return forcedConfinementPlatform(explicit) ?? process.platform;
+}
+
 function detectLandlock(impl) {
   if (typeof impl === "function") {
     return impl();
+  }
+  const override = landlockProbeOverride();
+  if (override) {
+    return override;
   }
   try {
     return /landlock/i.test(fs.readFileSync("/sys/kernel/security/lsm", "utf8")) ? "present" : "absent";
@@ -1286,7 +1561,61 @@ function detectLandlock(impl) {
   }
 }
 
-function describeConfinement(write, platform = process.platform, landlockImpl = undefined) {
+// One function, evaluated at launch and again when the record is written, so the argv
+// and the record agree unless the probe answer changes during the run. A task run builds
+// the argv first (executeTaskRun) and the record after; a review writes the record first
+// (executeReviewRun) and the argv after.
+// `off` is passed explicitly: dropping the flag would let a
+// sandbox profile in the user's own Grok config or GROK_SANDBOX re-trigger the refusal.
+// A managed requirement outranks the CLI flag (agent/config.rs:632-643, requirement >
+// CLI > env > config) and can still force a profile. ProfileName::Off skips the
+// apply-or-refuse branch (config/mod.rs:1473).
+function resolveReadOnlySandbox(platform, landlockImpl) {
+  const host = confinementPlatform(platform);
+  const landlock = host === "linux" ? detectLandlock(landlockImpl) : null;
+  return {
+    host,
+    landlock,
+    sandbox: landlock === "absent" ? "off" : "read-only"
+  };
+}
+
+function readOnlySandboxProfile(platform, landlockImpl) {
+  return resolveReadOnlySandbox(platform, landlockImpl).sandbox;
+}
+
+// The env override answers without reading the host. An injected
+// impl is a supplied probe result and is not this note.
+function forcedProbeNote(probeValue) {
+  return `The answer was forced by GROK_CC_LANDLOCK_PROBE=${probeValue} and the host was not probed.`;
+}
+
+// Off Linux the probe changes neither argv, kernelSandbox nor layers, so "forced by the
+// probe" would name a cause that does not exist. Where the
+// record WAS forced, the deciding variable is the platform override.
+function forcedPlatformNote(platformValue) {
+  return `The answer was forced by GROK_CC_CONFINEMENT_PLATFORM=${platformValue} and the host was not probed.`;
+}
+
+function disclosureForForcedLinuxProbe(probeValue, sandbox) {
+  const note = forcedProbeNote(probeValue);
+  if (sandbox === "off") {
+    return (
+      "Sandbox not requested on this kernel: " + note + " Current CLIs refuse to start rather than " +
+      "run --sandbox read-only without Landlock (measured on grok 1.0.70, 2026-10-24; the 1.0.45 " +
+      "source already exits 1). This bridge therefore passes --sandbox off on that answer, so a " +
+      "profile set in the user's own Grok config or GROK_SANDBOX cannot re-trigger the refusal. " +
+      "A managed requirement still outranks the CLI flag and can force a profile. Tool removal " +
+      "and deny rules are the whole barrier here."
+    );
+  }
+  return (
+    "Sandbox enforcement unverified on this kernel: " + note + " The bridge passes --sandbox " +
+    "read-only on that answer. Tool removal and deny rules are the barrier being relied on."
+  );
+}
+
+function describeConfinement(write, platform = undefined, landlockImpl = undefined) {
   if (write) {
     return {
       mode: "write",
@@ -1294,8 +1623,8 @@ function describeConfinement(write, platform = process.platform, landlockImpl = 
       kernelSandbox: "not-requested",
       disclosure:
         "Write mode: no confinement is enforced by this bridge — every tool is available " +
-        "and --always-approve is set. The throwaway --cwd and your review of the diff are " +
-        "the containment."
+        "and --always-approve is set. --cwd sets the working directory and the base for " +
+        "relative paths; it does not bound what the agent can read. Review the diff."
     };
   }
   // ⚠ Name the platforms that ARE enforced rather than excluding the one that is not.
@@ -1309,16 +1638,20 @@ function describeConfinement(write, platform = process.platform, landlockImpl = 
   // saying the third is unverified here rather than quietly asserting it works.
   // ⚠ AND "linux" IS NOT A MECHANISM EITHER — the same overclaim, one level in. Landlock is a
   // KERNEL CONFIG OPTION, and Raspberry Pi OS ships without it: measured 2026-08-09 on
-  // 6.12.96+rpt-rpi-2712, where the write landed and the CLI said nothing. So this descriptor
-  // told every Linux user that a third barrier held, while SECURITY.md and the acceptance gate
-  // said the opposite. Docs and code disagreeing about a security property is the defect;
-  // which of the two is wrong is a detail.
+  // 6.12.96+rpt-rpi-2712, where the write landed and the CLI said nothing. That was an older
+  // CLI. Current ones refuse to start (grok 1.0.70, 2026-10-24; the 1.0.45 source already
+  // does), so this descriptor says the sandbox was not requested: the bridge passes `off`.
+  // This descriptor, SECURITY.md and the acceptance gate have to agree on that: docs and code
+  // disagreeing about a security property is a defect in itself.
   //
   // Only a POSITIVE confirmation earns `enforced`. A probe that could not answer yields
   // `unverified` WITH a disclosure, never silence — the same asymmetry the acceptance detector
   // uses, for the same reason: saying "unknown" costs a sentence, and saying "enforced" wrongly
   // costs the reader their guard.
-  const landlock = platform === "linux" ? detectLandlock(landlockImpl) : null;
+  const { host, landlock, sandbox } = resolveReadOnlySandbox(platform, landlockImpl);
+  // An injected impl supplied the answer. The env override did not, so it must not
+  // suppress `enforced` for a caller that passed a real probe result.
+  const probeForced = typeof landlockImpl !== "function" ? landlockProbeOverride() : undefined;
   // ⚠ macOS DOES NOT EARN `enforced` EITHER — this was the last platform-name claim left in
   // the function. Seatbelt is part of the OS, so the mechanism exists by construction; but no
   // probe runs, this project has no Mac, and the README says macOS is unverified in real use.
@@ -1327,24 +1660,28 @@ function describeConfinement(write, platform = process.platform, landlockImpl = 
   // saying `enforced`, so the structured field — the one a consumer branches on — still
   // overstated it while the prose beside it admitted the assumption. Two independent reviews
   // reached this on 2026-08-09 without seeing each other's work.
-  const kernelEnforced = landlock === "present";
-  return {
+  // A forced probe is not a measurement, so it cannot earn `enforced`.
+  const kernelEnforced = !probeForced && sandbox === "read-only" && landlock === "present";
+  const record = {
     mode: "read-only",
     layers: kernelEnforced
       ? ["disallowed-tools", "deny-rules", "sandbox"]
       : ["disallowed-tools", "deny-rules"],
     // ⚠ THE ENUM AND THE PROSE MUST AGREE, and they did not off the two axes the tests cover.
     // `requested-not-enforced` means "we asked, and we know it does not hold" — true for
-    // Windows, and for a Linux kernel we probed and found no Landlock on. On FreeBSD, Android
-    // or anything else, nothing was ever probed: the disclosure said "unverified" while this
-    // field said "not enforced", and a machine consumer reads this field. Overconfidence in the
-    // structured channel is worse than in the prose, because nothing downstream re-reads the
-    // sentence. Found by a code review 2026-08-09.
+    // Windows, where `read-only` is still passed and the write lands. A Linux kernel with no
+    // Landlock is `not-requested`: we pass `off` rather than ask for a profile the CLI refuses
+    // to start. On FreeBSD, Android or anything else, nothing was ever probed: the disclosure
+    // said "unverified" while this field said "not enforced", and a machine consumer reads this
+    // field. Overconfidence in the structured channel is worse than in the prose, because
+    // nothing downstream re-reads the sentence. Found by a code review 2026-08-09.
     kernelSandbox: kernelEnforced
       ? "enforced"
-      : platform === "win32" || landlock === "absent"
-        ? "requested-not-enforced"
-        : "unverified",
+      : sandbox === "off"
+        ? "not-requested"
+        : host === "win32"
+          ? "requested-not-enforced"
+          : "unverified",
     // Two different statements, and conflating them would be the same overclaim in a new
     // place: on Windows this is measured, and anywhere else undocumented it is unverified.
     // Saying "a write still lands" on a platform nobody has tested would be inventing
@@ -1356,31 +1693,64 @@ function describeConfinement(write, platform = process.platform, landlockImpl = 
     // "the CLI applied it". Only `landlock === "present"` earns `enforced` (see
     // `kernelEnforced` above); macOS gets the disclosure branch and `kernelSandbox:
     // "unverified"`, same footing as any platform whose mechanism was not confirmed.
-    disclosure: kernelEnforced
+    disclosure: probeForced && host === "linux"
+      ? disclosureForForcedLinuxProbe(probeForced, sandbox)
+      : kernelEnforced
       ? null
-      : platform === "darwin"
+      : host === "darwin"
         ? "Sandbox enforcement unverified on macOS: Seatbelt is part of the OS, so the mechanism " +
           "is almost certainly there — but nothing here probes it, this project has no Mac, and " +
           "a mechanism existing is not the same as the CLI applying it. Tool removal and deny " +
           "rules are what the barrier actually rests on."
-        : landlock === "absent"
-        ? "Sandbox not enforced on this kernel: --sandbox read-only is passed, but Landlock is " +
-          "not among the active LSMs, so there is nothing to enforce it with and the CLI does " +
-          "not say so. Measured on Raspberry Pi OS 2026-08-09, where the write landed. Tool " +
-          "removal and deny rules are the whole barrier here."
+        : sandbox === "off"
+        ? "Sandbox not requested on this kernel: Landlock is not among the active LSMs, and " +
+          "current CLIs refuse to start rather than run --sandbox read-only without it " +
+          "(measured on grok 1.0.70, 2026-10-24; the 1.0.45 source already exits 1). This " +
+          "bridge therefore passes --sandbox off on this kernel, so a profile set in the user's " +
+          "own Grok config or GROK_SANDBOX cannot re-trigger the refusal. A managed requirement " +
+          "still outranks the CLI flag and can force a profile. Tool removal and deny rules are the " +
+          "whole barrier here."
         : landlock === "unknown"
           ? "Sandbox enforcement unverified on this kernel: /sys/kernel/security/lsm could not " +
             "be read, so whether Landlock is active is unknown — which is not the same as it " +
             "being absent, and is reported rather than assumed either way. Tool removal and " +
             "deny rules are the barrier being relied on."
-          : platform === "win32"
+          : host === "win32"
         ? "Sandbox not enforced on this platform (win32): --sandbox read-only is passed, but a " +
           "write still lands — measured against grok 1.0.0, and the CLI itself says nothing. " +
           "Tool removal and deny rules are the whole barrier here."
-        : `Sandbox enforcement unverified on this platform (${platform}): xAI documents Landlock ` +
+        : `Sandbox enforcement unverified on this platform (${host}): xAI documents Landlock ` +
           "on Linux and Seatbelt on macOS and names no mechanism for anything else, so this " +
           "bridge does not assume one. Tool removal and deny rules are the barrier being relied " +
           "on. Nobody has measured whether the sandbox holds here — that is a gap, not a claim."
+  };
+  // The Linux replacement already carries the probe note. Off Linux the probe decides
+  // nothing, so a note appears only when the platform override decided the host: a
+  // recognised GROK_CC_CONFINEMENT_PLATFORM, the probe override set, and no explicit
+  // platform argument. Otherwise the host sentence was measured and stays unannotated.
+  const platformForced = forcedConfinementPlatform(platform);
+  if (platformForced && host !== "linux" && record.disclosure) {
+    record.disclosure = `${record.disclosure} ${forcedPlatformNote(platformForced)}`;
+  }
+  return record;
+}
+
+// The read-only descriptor plus the one opening connector mode makes. Its own mode, so a
+// consumer branching on `mode` never reads a run that can create calendar events as read-only.
+function describeConnectorConfinement(connectors, platform = undefined, landlockImpl = undefined) {
+  const base = describeConfinement(false, platform, landlockImpl);
+  const allowRules = connectors.map(connectorAllowRule);
+  const opening =
+    `Connector mode (${connectors.join(", ")}): search_tool and use_tool are available, the MCPTool deny rule is dropped, and ${allowRules.join(", ")} pre-approve${allowRules.length === 1 ? "s" : ""} every tool ${allowRules.length === 1 ? "it covers" : "they cover"}, including ones that create, send, change or delete. ` +
+    "The run is pinned to --permission-mode default, so a tool of any other connector raises a permission request, which a headless run answers with Cancelled — unless your own settings already decide it, because the CLI adds them on top: allow rules in your Grok config, managed policy or Claude Code settings, \"Always allow\" grants saved for this repository, or a Claude defaultMode of auto (an LLM classifier decides instead) or bypassPermissions (everything is approved). A local MCP server with the same name as a named connector is opened too, and takes precedence. " +
+    "A tool call cannot start a subagent or a workflow here: the bare Edit and Write deny rules reach those tools and are enforced before any approval mode. Measured 2026-10-15 on grok 1.0.52, the spawn was refused with \"Denied by permission policy: deny rule on edit\" and no subagents directory appeared. Children exist only in --write runs today. That refusal is a side effect of how the CLI classifies those tools, not a documented contract, so a CLI change could reopen it. Where a child does run, it shares the parent's permission rules, saved grants and approval mode and carries over the tool removal list; that inheritance is read from the CLI source and is not measured. This prompt opens with the bridge's note, so the CLI's slash dispatcher never reads it as a command. " +
+    "Anything the agent can read, it can also write into a named connector that accepts text. --cwd sets the working directory and the base for relative paths. It does not bound reads: a connector run can read any file the user account can read, including ~/.ssh, ~/.claude and ~/.grok, and a prompt-injected connector payload can pull those files into the model's context and from there into a writable connector. That is the CLI's design in 1.0.41 and 1.0.45; 1.0.52 is unverified from source.";
+  return {
+    ...base,
+    mode: "connector",
+    connectors,
+    allowRules,
+    disclosure: base.disclosure ? `${opening} ${base.disclosure}` : opening
   };
 }
 
@@ -1409,6 +1779,18 @@ async function executeTaskRun(request) {
         phase: "starting"
       })
   });
+
+  // The kill switch again, at the last moment before a launch: the command-level check ran
+  // once, and a batch line or a run that waited for a slot can start long after `disable`.
+  try {
+    assertBridgeEnabled();
+  } catch (error) {
+    try {
+      slot.release();
+    } catch {
+    }
+    throw error;
+  }
 
   // Serialize runs that continue the SAME named conversation: interleaving turns in
   // one Grok session corrupts its history for both callers.
@@ -1453,19 +1835,30 @@ async function executeTaskRun(request) {
     // Write mode is sealed by the launch path (CLI --write / worker --write), never
     // promoted from a tampered on-disk request alone.
     const write = Boolean(request.write);
+    // handleTask already refuses --connector with --write; this keeps a request that reaches
+    // here some other way from quietly running with both.
+    const connectors = parseConnectorList(request.connectors);
+    const connectorMode = connectors.length > 0;
+    if (connectorMode && write) {
+      throw new Error("--connector cannot be combined with --write.");
+    }
 
     // Read-only enforcement, in this order of reliability:
     //  1. --disallowed-tools removes the writing/executing tools from the toolset
     //     (headless-only). Every id is verified against the installed CLI — see the list
     //     itself for why, and for how to re-verify when the registry moves.
     //  2. --deny rules reject those tool classes even if a tool slips back in.
-    //  3. --sandbox read-only is always passed; kernel enforcement is reported only where
-    //     a probe confirms it (Landlock present on Linux → `enforced`). macOS is
-    //     `unverified` (Seatbelt exists by construction, nothing here probes the CLI
-    //     applying it); Windows and Landlock-absent Linux are `requested-not-enforced`.
-    //     Measured 2026-08-08 against grok 1.0.0 on Windows: a direct run with the flag
-    //     set wrote the file anyway, exit 0, and stderr was empty — the CLI does not say
-    //     so. Acceptance step 2b re-checks the mechanism on every release.
+    //  3. --sandbox comes from resolveReadOnlySandbox, the same function as the record.
+    //     `read-only` where a probe confirms Landlock (`enforced`), and on Windows, macOS
+    //     and an unanswered probe. A forced GROK_CC_LANDLOCK_PROBE=present still passes
+    //     `read-only` but records `unverified`, because nothing was measured.
+    //     Linux with Landlock absent passes `off`
+    //     (`not-requested`): current CLIs refuse to start `read-only` there (grok 1.0.70,
+    //     2026-10-24; cli-1.0.45 config/mod.rs:1489-1495). macOS is `unverified`. Windows
+    //     is `requested-not-enforced`. Measured 2026-08-08 against grok 1.0.0 on Windows,
+    //     and again on grok 1.0.70 on 2026-10-24: a direct run with the flag set wrote the
+    //     file anyway, exit 0, and stderr was empty — the CLI does not say so. Acceptance
+    //     step 2b re-checks the mechanism on every release.
     //
     // ⚠ Layers 1 and 2 BOTH hold on Windows. An earlier version of this comment called
     // layer 1 "the only barrier that holds on Windows", which is wrong and was wrong in
@@ -1473,8 +1866,11 @@ async function executeTaskRun(request) {
     // 1.0.0 run showed the DENY RULES doing the stopping, and layer 1 covering neither
     // attempted path. Two independent layers, and the ordering above is about how much
     // each is trusted, not about which platforms each survives.
-    // Plan mode is NOT used as a barrier: its "present plan, await approval" fork
-    // dead-ends in headless mode (the stub bug), hence --no-plan.
+    // Plan mode is not the barrier. `--no-plan` is still passed because it is harmless and
+    // keeps TUI parity; a headless (`-p` / `--prompt-file`) run never reads it
+    // (event_loop.rs:1116 is the only consumer; HeadlessOptions has no plan field,
+    // headless.rs:53-95). Plan tools stay offered, and the headless client auto-approves
+    // exit_plan_mode (ext_protocol.rs:32-36), so plan mode cannot stall the run.
     // The agent's working directory is the directory the CALLER asked for, not the
     // workspace root derived from it.
     //
@@ -1482,10 +1878,9 @@ async function executeTaskRun(request) {
     // workspace root has to be the git top level so a `git init` mid-run cannot orphan the
     // job record — that is a real fix and it stays. But `runHeadlessAgent` defaults the
     // agent's `--cwd` to the same value, so `--cwd packages/auth` silently became `--cwd
-    // <repo root>`: wider than requested, including under `--write`, where `--cwd` is the
-    // only containment there is. It contradicted the README's own example, SECURITY.md's
-    // "point --cwd at the repository under review and nothing wider", and this file's own
-    // comment calling the throwaway --cwd the containment.
+    // <repo root>`: wider than requested, including under `--write`. `--cwd` is the working
+    // directory, not a read boundary (absolute and `~` paths are read as given), but the
+    // widening still contradicted the README's own example.
     const agentCwd = request.cwd ? path.resolve(request.cwd) : workspaceRoot;
     const headlessOptions = {
       cwd: agentCwd,
@@ -1494,11 +1889,22 @@ async function executeTaskRun(request) {
       maxTurns: request.maxTurns ?? undefined,
       timeoutMs: request.timeoutMs ?? undefined,
       alwaysApprove: write,
-      permissionMode: undefined,
+      // Connector mode pins the approval mode, because its allow rules are only a gate while
+      // unmatched permission requests are refused. Without the flag the CLI takes the mode from
+      // `[ui] permission_mode` in ~/.grok/config.toml, which the TUI persists when the user
+      // toggles always-approve; measured 2026-09-23, a run then called a calendar tool outside
+      // its allow rule. A CLI --permission-mode wins over that setting completely.
+      permissionMode: connectorMode ? "default" : undefined,
       noPlan: !write,
-      sandbox: write ? undefined : "read-only",
-      disallowedTools: write ? undefined : READ_ONLY_DISALLOWED_TOOLS,
-      denyRules: write ? undefined : READ_ONLY_DENY_RULES,
+      sandbox: write ? undefined : readOnlySandboxProfile(),
+      disallowedTools: write
+        ? undefined
+        : connectorMode
+          ? CONNECTOR_DISALLOWED_TOOLS
+          : READ_ONLY_DISALLOWED_TOOLS,
+      denyRules: write ? undefined : connectorMode ? CONNECTOR_DENY_RULES : READ_ONLY_DENY_RULES,
+      allowRules: connectorMode ? connectors.map(connectorAllowRule) : undefined,
+      env: connectorMode ? { ...process.env, ...CONNECTOR_CHILD_ENV } : undefined,
       outputFormat: "json",
       jsonSchema: request.jsonSchema ?? undefined,
       onProgress: request.onProgress
@@ -1510,9 +1916,23 @@ async function executeTaskRun(request) {
     let delivered = false;
     let nudged = false;
     let nudgeError = "";
+    // Set only when the empty-reply retry was the one term that failed, so the result
+    // can say why instead of looking like a run that was never going to retry.
+    let nudgeSkippedReason = "";
+    // Connector runs: a marker in the prompt is this run's anchor in the session history.
+    // The CLI rewrites chat_history.jsonl rather than appending, so a byte offset does not
+    // stay on the turn boundary.
+    const connectorMark = connectorMode
+      ? { marker: newConnectorRunMarker(), since: Date.now() - 1000 }
+      : null;
+    const slashGuarded = !connectorMode && !write && promptStartsWithSlash(prompt);
     try {
       result = await runHeadlessAgent(workspaceRoot, {
-        prompt,
+        prompt: connectorMode
+          ? `${connectorPromptPreamble(connectors, connectorMark.marker)}\n\n${prompt}`
+          : slashGuarded
+            ? `${SLASH_GUARD_LINE}\n\n${prompt}`
+            : prompt,
         resumeSessionId,
         slot,
         ...headlessOptions
@@ -1547,16 +1967,24 @@ async function executeTaskRun(request) {
 
       // Backstop: exit 0 with no output → one automatic nudge into the same session.
       // Never for --write runs: re-running a mutating task unattended could repeat
-      // side effects that already happened.
+      // side effects that already happened. Never for --connector runs either, for the same
+      // reason: `write` is false there, but a connector can create, send or delete, and a
+      // nudge after a partial run could, for example, create a second calendar event.
       // …and never when the bridge already knows the retry cannot help: nudging a CLI that
       // just said nobody is signed in, or that the allowance is gone, spends a second run
-      // to be told the same thing.
-      if (
+      // to be told the same thing. Nor after a `disable` that landed during the first run:
+      // the nudge is a second CLI session, and the switch promises none will start.
+      const nudgeEligible =
         !write &&
+        !connectorMode &&
         result.status === 0 &&
         !RETRY_CANNOT_HELP.has(result.failureKind) &&
-        !hasDeliverable(result)
-      ) {
+        !hasDeliverable(result);
+      const disabledForNudge = nudgeEligible ? readDisabledFlag() : null;
+      if (disabledForNudge) {
+        nudgeSkippedReason = disabledForNudge.reason ?? "";
+      }
+      if (nudgeEligible && !disabledForNudge) {
         const firstResult = result;
         try {
           const retry = await runHeadlessAgent(workspaceRoot, {
@@ -1576,13 +2004,22 @@ async function executeTaskRun(request) {
           // summed a confident, wrong number, and there is no quota endpoint to reconcile it
           // against; the local record is the only view there is.
           //
-          // It undercounts hardest where it hurts most: the trigger is "a turn was spent and no
-          // text came back", which is exactly what a `--max-turns` exhaustion emits. Measured
-          // 2026-08-09 against the suite's own `empty-then-ok` fixture — 2 launches, one turn's
-          // usage recorded, `usageIncomplete: false`. Found by an architectural review.
+          // The nudge runs only for an empty exit-0 turn. Exhausting `--max-turns` is a
+          // different event: the CLI prints a result envelope, writes "Error: max turns
+          // reached" on stderr, and exits 1, so this branch does not run.
+          // Measured 2026-08-09 against `empty-then-ok`: 2 launches, and before the sum
+          // only one launch's usage was recorded.
           //
           // If either attempt reported no usage at all we cannot sum honestly, so the record
-          // says so rather than presenting a partial total as complete.
+          // says so rather than presenting a partial total as complete. A launch the CLI
+          // marked incomplete stays incomplete after the merge. So does a launch that
+          // reported usage and no cost while the other launch reported a cost: the summed
+          // ticks would otherwise look like the whole bill. Both launches unpriced, which
+          // is what `empty-then-ok` emits, stays complete — the usages were measured, and
+          // there is no priced side for a missing cost to contradict.
+          const siblingWithheldCost =
+            (launchHasUsageWithoutCost(firstResult) && launchReportedCost(retry)) ||
+            (launchHasUsageWithoutCost(retry) && launchReportedCost(firstResult));
           result = {
             ...retry,
             structuredOutput: retry.structuredOutput ?? firstResult.structuredOutput ?? null,
@@ -1590,7 +2027,11 @@ async function executeTaskRun(request) {
             costTicks: addCostTicks(firstResult.costTicks, retry.costTicks),
             costUsd: addCostUsd(firstResult.costUsd, retry.costUsd),
             numTurns: addTurns(firstResult.numTurns, retry.numTurns),
-            spendIncomplete: !firstResult.usage || !retry.usage
+            spendIncomplete: !firstResult.usage || !retry.usage,
+            usageIncomplete:
+              firstResult.usageIncomplete === true ||
+              retry.usageIncomplete === true ||
+              siblingWithheldCost
           };
         } catch (error) {
           // A failed retry must not destroy the (empty but honest) first result.
@@ -1641,6 +2082,32 @@ async function executeTaskRun(request) {
       delivered = false;
     }
 
+    // Connector runs: the result carries no tool calls, so confirm from the CLI's own session
+    // history that the connector catalog ever loaded. When it did not, the reply is about an
+    // empty toolbox, not about the connector, however confident it reads — measured once in
+    // four runs on 2026-09-23 (see lib/connector-evidence.mjs). Nothing reached the connector
+    // in that case, so the run is safe to repeat, and the failure message says so.
+    let connectorCheck = null;
+    if (connectorMode && result.status === 0 && !result.failureKind && result.sessionId) {
+      connectorCheck = assessConnectorRun(result.sessionId, {
+        cwd: agentCwd,
+        marker: connectorMark.marker,
+        since: connectorMark.since
+      });
+    }
+    // A call the allow rules refused ends a headless run on the spot — the CLI reports
+    // stopReason "cancelled" and nothing planned after the call runs (observed 3 of 3 on
+    // 2026-09-23/24, and again on CLI 1.0.44; normal runs end "end_turn"). The text left is
+    // whatever the model said before the call, so this is not a deliverable either, and
+    // repeating it gets the same refusal. It is decided FIRST: otherwise a refusal-ended run
+    // whose first search came back empty (the catalog race the prompt note polls through) would
+    // be reported as a missing catalog, with advice to re-run that could only be refused again.
+    const connectorRefused = connectorCheck?.refusedCalls > 0 && result.stopReason === "cancelled";
+    const connectorUnavailable = !connectorRefused && connectorCheck?.verdict === "never-loaded";
+    if (connectorUnavailable || connectorRefused) {
+      delivered = false;
+    }
+
     // Register the named thread only for runs that actually produced something:
     // pointing a name at a failed session would poison every continuation.
     let threadRegistered = false;
@@ -1666,11 +2133,15 @@ async function executeTaskRun(request) {
             ? result.failureKind
             : result.stdoutTruncated
               ? "output-truncated"
-              : delivered
-                ? null
-                : schemaFailure
-                  ? "schema-parse"
-                  : "no-deliverable";
+              : connectorUnavailable
+                ? "connector-unavailable"
+                : connectorRefused
+                  ? "connector-refused"
+                  : delivered
+                    ? null
+                    : schemaFailure
+                      ? "schema-parse"
+                      : "no-deliverable";
     // Exit 2 is the contract for "the bridge knows why there is no deliverable", so a
     // failure the bridge classified itself belongs there — even though the CLI happened
     // to exit 1. Otherwise the documented exit code and the real one disagree.
@@ -1686,7 +2157,9 @@ async function executeTaskRun(request) {
     // so a successful deliverable is not rendered as "Run did not succeed".
     const failureParts = [];
     const warnings = [];
-    const confinement = describeConfinement(write);
+    const confinement = connectorMode
+      ? describeConnectorConfinement(connectors)
+      : describeConfinement(write);
     if (confinement.disclosure) {
       warnings.push(confinement.disclosure);
     }
@@ -1708,6 +2181,14 @@ async function executeTaskRun(request) {
       failureParts.push(
         result.stderr || result.failureDetail || `Grok exited with status ${result.status}.`
       );
+    } else if (connectorUnavailable) {
+      failureParts.push(
+        `The connector catalog never loaded in this run: no search_tool call found a tool and no use_tool call reached one (${connectorCheck.searchCalls} search, ${connectorCheck.useCalls} use), so nothing reached the connector and the reply is not about it. Running it again is safe and usually works.`
+      );
+    } else if (connectorRefused) {
+      failureParts.push(
+        `${connectorCheck.refusedCalls} connector call(s) were refused because no allow rule of this run covers them, and a refusal ends a headless run at once, so nothing planned after the call ran. Running the same request again gets the same refusal; name the tool in --connector if the call was intended, or leave it out of the request.`
+      );
     } else if (!delivered) {
       failureParts.push(
         schemaFailure ||
@@ -1721,8 +2202,66 @@ async function executeTaskRun(request) {
     if (nudgeError) {
       failureParts.push(`Automatic retry could not run: ${nudgeError}`);
     }
+    if (nudgeSkippedReason) {
+      // Its own sentence, so it does not read as plain "Grok returned no output.", the
+      // sentence of a run that was never going to retry. It is part of the failure
+      // text and of `warnings` (the --json contract); render.mjs prints it once.
+      const nudgeSkipped =
+        `Automatic retry skipped: Grok Build was disabled during the run (${nudgeSkippedReason}).`;
+      failureParts.push(nudgeSkipped);
+      warnings.push(nudgeSkipped);
+    }
     if (threadRegistrationError) {
       warnings.push(threadRegistrationError);
+    }
+    if (slashGuarded) {
+      warnings.push(
+        'The prompt began with "/", which the Grok CLI can take as one of its own slash commands. This read-only run put a note line in front of it, so the prompt no longer starts with "/".'
+      );
+    }
+    if (connectorCheck?.verdict === "unreadable") {
+      warnings.push(
+        "Could not read this run's Grok session history, so whether the connector catalog loaded is unconfirmed."
+      );
+    } else if (connectorCheck?.verdict === "no-connector-calls" && connectorCheck.reason === "subagents") {
+      // The parent's history really has no connector call, and that is not the same claim
+      // as "nothing in the reply comes from a connector" once a child started during the run.
+      warnings.push(
+        "This connector run's parent made no search_tool or use_tool call, and a subagent started during the run whose calls are not checked."
+      );
+    } else if (connectorCheck?.verdict === "no-connector-calls") {
+      warnings.push(
+        "This connector run made no search_tool or use_tool call, so nothing in the reply comes from a connector."
+      );
+    } else if (connectorCheck?.verdict === "inconclusive" && !connectorRefused) {
+      const why = {
+        subagents: "the run spawned subagents, whose calls are in a history of their own and are not included",
+        "marker-missing": "this run's marker was not found in the session history that was read",
+        "no-sign": "it has connector calls with no sign either way",
+        unreadable: "the session history could not be read"
+      }[connectorCheck.reason] ?? "the history does not settle it";
+      warnings.push(
+        `This run's session history does not show whether the connector catalog loaded: ${why}.`
+      );
+    }
+    // --max-turns exhaustion is also stopReason "cancelled" (cli-1.0.45
+    // turn.rs:1712-1713, headless.rs:1397-1406) and exits non-zero, so the history was never
+    // read. Saying it "does not show" a refusal asserts a check that did not happen, and it
+    // must not sit beside the "could not read" warning either.
+    if (connectorMode && result.stopReason === "cancelled" && !connectorRefused) {
+      const historyRead = connectorCheck != null && connectorCheck.verdict !== "unreadable";
+      warnings.push(
+        historyRead
+          ? "The run ended cancelled. In connector mode that is how a refused call ends a run, but its session history does not show one, so treat anything planned after that point as not done."
+          : "The run ended cancelled and its session history was not checked."
+      );
+    }
+    if (connectorCheck?.refusedCalls > 0 && !connectorRefused) {
+      // A PolicyDeny or an unresolved MCP permission lets the turn continue (tool_calls.rs:1945,
+      // :1981). connector-refused stays tied to stopReason "cancelled"; this is the other path.
+      warnings.push(
+        `${connectorCheck.refusedCalls} connector call(s) were refused, and the run continued.`
+      );
     }
     const failureMessage = failureParts.join(" ");
     // One expression for "this run hard-failed", read by both the rendered text and the
@@ -1768,6 +2307,16 @@ async function executeTaskRun(request) {
       failureMessage,
       warnings,
       confinement,
+      // Connector runs only: what the session history showed about the connector catalog.
+      connectorCheck: connectorCheck
+        ? {
+            verdict: connectorCheck.verdict,
+            searchCalls: connectorCheck.searchCalls,
+            useCalls: connectorCheck.useCalls,
+            refusedCalls: connectorCheck.refusedCalls,
+            reason: connectorCheck.reason ?? null
+          }
+        : null,
       stateRoot: stateRootOrigin,
       nudged,
       timedOut: Boolean(result.timedOut),
@@ -2048,9 +2597,10 @@ export function enqueueBackgroundJob(cwd, job, request, options = {}) {
   });
   const workerPid = child?.pid ?? null;
   if (workerPid != null) {
+    // The worker may already have taken the lock and marked the job running, with the grok
+    // pid stored. Writing status, phase, or agentPid again rolls that back, and the worker
+    // only reports agentPid when it changes, so stop then has no pid (upstream #61, 2026-10-24).
     patchJobIfActive(job.workspaceRoot, job.id, {
-      status: "queued",
-      phase: "queued",
       pid: workerPid,
       bridgePid: workerPid,
       // The worker is spawned as process.execPath, so this is what it is. Recorded here
@@ -2059,7 +2609,6 @@ export function enqueueBackgroundJob(cwd, job, request, options = {}) {
       // just changed their mind about — and until now that was the one current-version
       // record carrying a pid with no image to check it against.
       bridgeImage: path.basename(process.execPath),
-      agentPid: null,
       logFile
     });
   }
@@ -2079,6 +2628,7 @@ export function enqueueBackgroundJob(cwd, job, request, options = {}) {
 }
 
 async function handleReviewCommand(argv, config) {
+  assertBridgeEnabled();
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "effort", "cwd", "timeout-ms", "max-turns"],
     booleanOptions: ["json", "background", "wait"],
@@ -2186,6 +2736,7 @@ function validateJsonSchemaOption(value) {
 }
 
 async function handleTask(argv) {
+  assertBridgeEnabled();
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: [
       "model",
@@ -2196,7 +2747,8 @@ async function handleTask(argv) {
       "thread",
       "json-schema",
       "timeout-ms",
-      "max-turns"
+      "max-turns",
+      "connector"
     ],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     // Everything from the first prompt word on is task text, never flags: an unquoted
@@ -2216,6 +2768,22 @@ async function handleTask(argv) {
   const promptsFile = options["prompts-file"]
     ? path.resolve(cwd, String(options["prompts-file"]))
     : null;
+  const connectors = parseConnectorList(options.connector);
+  if (connectors.length > 0) {
+    // Connector mode is foreground-only and single-prompt: the background worker seals only
+    // --write on its argv, and a batch would repeat a connector action once per line.
+    if (options.write) {
+      throw new Error(
+        "--connector cannot be combined with --write: connector mode keeps the read-only toolset and opens only the named connectors."
+      );
+    }
+    if (options.background) {
+      throw new Error("--connector cannot be combined with --background.");
+    }
+    if (promptsFile) {
+      throw new Error("--connector cannot be combined with --prompts-file.");
+    }
+  }
 
   // Sequential multi-prompt batch: one NDJSON line per prompt, one result line each.
   // Not compatible with --background / --prompt-file / positional prompt.
@@ -2306,6 +2874,7 @@ async function handleTask(argv) {
         effort,
         prompt,
         write,
+        connectors,
         resumeLast,
         thread,
         fresh,
@@ -2423,6 +2992,59 @@ async function handlePromptsFileBatch(options) {
   }
 }
 
+/**
+ * Refuse before anything is resolved, before git runs, before any process is considered —
+ * this must be the very first thing a gated command does, not a check woven in alongside
+ * its other setup, or a caller could pay some of the cost of a run this flag exists to
+ * prevent before ever reaching the refusal.
+ */
+function assertBridgeEnabled() {
+  const flag = readDisabledFlag();
+  if (flag) {
+    // A synthetic fail-closed record (unreadable flag, relative
+    // override) has disabledAt "unknown". Name the path; `enable` cannot always
+    // clear that entry, and the reason alone is easy to miss.
+    const location =
+      flag.disabledAt === "unknown" && flag.path ? ` Flag: ${flag.path}.` : "";
+    throw new Error(
+      `Grok Build is disabled: ${flag.reason} (since ${flag.disabledAt}).${location} ` +
+        "Re-enable with: node grok-bridge.mjs enable"
+    );
+  }
+}
+
+function handleDisable(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["reason"],
+    booleanOptions: ["json"]
+  });
+  const reason = String(options.reason ?? "").trim();
+  if (!reason) {
+    throw new Error(
+      'disable requires a reason: node grok-bridge.mjs disable --reason "weekly allowance exhausted"'
+    );
+  }
+  const record = writeDisabledFlag(reason);
+  outputCommandResult(
+    { disabled: true, ...record },
+    `Grok Build disabled: ${record.reason}\n` +
+      `(since ${record.disabledAt}; flag: ${record.path})\n` +
+      "From now on no run, review or critique of this bridge starts a Grok session — including runs already waiting for a slot or queued in a batch — and check --verify-tools skips its test session.\n" +
+      "Re-enable with: node grok-bridge.mjs enable",
+    options.json
+  );
+}
+
+function handleEnable(argv) {
+  const { options } = parseCommandInput(argv, { booleanOptions: ["json"] });
+  const wasDisabled = clearDisabledFlag();
+  outputCommandResult(
+    { disabled: false, wasDisabled },
+    wasDisabled ? "Grok Build re-enabled." : "Grok Build was not disabled.",
+    options.json
+  );
+}
+
 function handleUsage(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["days"],
@@ -2454,10 +3076,43 @@ async function readStoredJobWithRetry(workspaceRoot, jobId, options = {}) {
 }
 
 async function handleTaskWorker(argv) {
+  // ⚠ Gated independently of handleTask, not only through it. `run-worker` is its own
+  // top-level subcommand — reachable directly, not merely as an internal detail of `run` —
+  // so relying on the caller's check would leave a second door into the same spend if
+  // anything ever invokes this one on its own.
+  //
+  // Parse before the gate so a refusal can be written onto the job it was handed. Parsing
+  // argv does not spend. This process is spawned with stdio ignored, so a throw here would
+  // leave the record queued until the next listing called it "Orphaned".
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id", "workspace-root"],
     booleanOptions: ["write"]
   });
+  let refusal = null;
+  try {
+    assertBridgeEnabled();
+  } catch (error) {
+    refusal = error;
+  }
+  if (refusal) {
+    const rawJobId = options["job-id"];
+    if (rawJobId) {
+      try {
+        const jobId = assertValidJobId(rawJobId);
+        const workspaceRoot = options["workspace-root"] || resolveCommandWorkspace(options);
+        const storedJob = readStoredJob(workspaceRoot, jobId);
+        if (storedJob && storedJob.id === jobId) {
+          claimJobTerminal(workspaceRoot, jobId, "failed", {
+            errorMessage: refusal instanceof Error ? refusal.message : String(refusal),
+            phase: "failed"
+          });
+        }
+      } catch {
+        // The refusal is the outcome. A claim that cannot land must not replace it.
+      }
+    }
+    throw refusal;
+  }
 
   if (!options["job-id"]) {
     throw new Error("Missing required --job-id for run-worker.");
@@ -2512,6 +3167,9 @@ async function handleTaskWorker(argv) {
     ...request,
     cwd,
     write: sealedWrite,
+    // Connector mode is foreground-only, so a background worker never runs it; an edited
+    // record must not be able to open connectors the parent never asked for.
+    connectors: [],
     onProgress: progress
   };
 
@@ -3109,6 +3767,12 @@ async function main() {
     case "usage":
       handleUsage(argv);
       break;
+    case "disable":
+      handleDisable(argv);
+      break;
+    case "enable":
+      handleEnable(argv);
+      break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
   }
@@ -3181,9 +3845,15 @@ export {
   readStoredJobWithRetry,
   isPlausibleSchemaObject,
   describeConfinement,
+  describeConnectorConfinement,
+  readOnlySandboxProfile,
+  parseConnectorList,
   MAX_JSON_SCHEMA_CHARS,
   READ_ONLY_DISALLOWED_TOOLS,
   READ_ONLY_DENY_RULES,
+  CONNECTOR_DISALLOWED_TOOLS,
+  CONNECTOR_DENY_RULES,
+  CONNECTOR_CHILD_ENV,
   TOOL_ID_PROBE_CONTROL,
   interpretToolIdProbe
 };

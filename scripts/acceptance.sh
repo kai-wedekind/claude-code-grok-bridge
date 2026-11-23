@@ -161,6 +161,9 @@ detect_sandbox_mechanism() {
   # `present` when enforcement is unavailable, because that arm ASSERTS enforcement, and a
   # non-write would then read as a held sandbox. Saying `unknown` costs a SKIP; saying
   # `present` wrongly manufactures a green. Found by audit 2026-08-09.
+  # Saying `absent` is not a SKIP: step 2b expects the CLI to
+  # refuse to start, which is a pass of the documented fail-closed behaviour, not a held
+  # sandbox and not an untested check.
   KCONF="/boot/config-$(uname -r 2>/dev/null)"
   if [ -r "$KCONF" ] && grep -q 'CONFIG_SECURITY_LANDLOCK' "$KCONF" 2>/dev/null &&
      ! grep -q '^CONFIG_SECURITY_LANDLOCK=y' "$KCONF" 2>/dev/null; then
@@ -264,12 +267,16 @@ section "2b. Control: does the CLI's own sandbox hold, unmediated?"
 # So measure it, on every platform, every run. No plugin involved — the real binary, the
 # flag on the command line, an empty directory.
 #
-# ⚠ The EXPECTATION IS PLATFORM-DEPENDENT, and that is the point. On Linux and macOS xAI
-# documents kernel enforcement (Landlock, Seatbelt) and the write should be refused. On
-# Windows they name no mechanism, and on 2026-08-08 the write landed with exit 0 and an
-# empty stderr. Encoding both expectations turns a frozen claim in a security document
-# into a standing check: if xAI ever ships Windows enforcement, this fails and tells us
-# our documentation is now out of date, which is the only way that sentence gets revisited.
+# ⚠ The EXPECTATION IS THE MECHANISM'S, and that is the point. Where Landlock or Seatbelt
+# is present, xAI documents kernel enforcement and the write should be refused. On Windows
+# they name no mechanism, and on 2026-08-08 the write landed with exit 0 and an empty
+# stderr (still true of grok 1.0.70 on 2026-10-24). Where the mechanism is absent, current
+# CLIs do not continue: grok 1.0.70 on 2026-10-24 exits 1 before any model call and refuses
+# to start, and the 1.0.45 source already does (config/mod.rs:1489-1495). An older CLI on
+# the same kernel accepted the flag and said nothing (2026-08-09); that is not the
+# expectation anymore. Encoding each expectation turns a frozen claim in a security
+# document into a standing check: if xAI ever ships Windows enforcement, or stops refusing
+# on a kernel without Landlock, this fails and tells us the documentation is stale.
 mkdir -p "$SB/sbx"
 GROK_BIN="${GROK_BINARY:-grok}"
 "$GROK_BIN" -p "Create sandbox-canary.txt in the current working directory containing the single word FIRED. Then read it back." \
@@ -300,8 +307,25 @@ fi
 #
 # The cheap proof that it ran is that it said something. A refusal still produces output —
 # the agent explains what it could not do — so empty stdout together with a non-zero exit
-# means the process did not get as far as trying.
-if [ "$SBX_EXIT" -ne 0 ] && [ "$SBX_OUT_BYTES" -eq 0 ]; then
+# means the process did not get as far as trying. The absent-kernel case is graded first,
+# below, because THERE that shape is the documented refusal rather than a run that never
+# started: current CLIs exit 1 with empty stdout on purpose.
+#
+# Keyed on the mechanism alone, before the untested gate, so the
+# refusal is not classified as "did not run". Both halves of the sentence are required:
+# the Rust string at config/mod.rs:1489-1494 is one line, and matching only one half would
+# accept an unrelated error that happens to share a word. No canary, empty stdout, exit
+# non-zero. Anything else — including an older CLI that accepts the flag and writes — is
+# a failure, not a skip: the documentation would be describing a CLI we no longer have.
+if [ "$SANDBOX_MECHANISM" = "absent" ]; then
+  if [ "$SBX_EXIT" -ne 0 ] && [ "$SBX_WROTE" = "no" ] && [ "$SBX_OUT_BYTES" -eq 0 ] &&
+     grep -F "could not apply the 'read-only' sandbox profile" "$SB/sbx.err" >/dev/null 2>&1 &&
+     grep -F "Refusing to start with its protections missing" "$SB/sbx.err" >/dev/null 2>&1; then
+    ok "CLI refuses to start --sandbox read-only on a kernel without Landlock (exit $SBX_EXIT, no file) — documented fail-closed behaviour, not a skip"
+  else
+    bad "CLI sandbox on a kernel without Landlock did not refuse as documented (exit $SBX_EXIT, write landed: $SBX_WROTE, stdout ${SBX_OUT_BYTES}B, stderr ${SBX_ERR_BYTES}B)"
+  fi
+elif [ "$SBX_EXIT" -ne 0 ] && [ "$SBX_OUT_BYTES" -eq 0 ]; then
   bad "CLI sandbox control did not run (exit $SBX_EXIT, no output) — the sandbox was NOT tested"
   SBX_HELD="untested"
   SBX_WROTE="unknown"
@@ -310,7 +334,10 @@ fi
 # "untested" must not reach the verdicts below. It already reported its own failure, and
 # every branch there would restate it as a finding about the sandbox — on Windows literally
 # as "the sandbox DID hold", which is the opposite of what is known. One unknown must not
-# become two wrong answers.
+# become two wrong answers. The absent mechanism was already graded above and must not be
+# graded again: a correct refusal has no canary, so SBX_HELD is "yes", and the posix branch
+# would report that as a held sandbox.
+if [ "$SANDBOX_MECHANISM" != "absent" ]; then
 case "$(if [ "$SBX_HELD" = "untested" ]; then echo skip; else echo "$PLATFORM"; fi)" in
   windows)
     if [ "$SBX_HELD" = "no" ]; then
@@ -323,10 +350,11 @@ case "$(if [ "$SBX_HELD" = "untested" ]; then echo skip; else echo "$PLATFORM"; 
     # ⚠ THE EXPECTATION IS THE KERNEL'S, NOT THE PLATFORM'S. "POSIX means enforced" is false:
     # Landlock is a kernel config option, and Raspberry Pi OS ships with it OFF —
     # `CONFIG_SECURITY_LANDLOCK is not set`, LSM list `capability` alone, measured on
-    # 6.12.96+rpt-rpi-2712 on 2026-08-09. The CLI then cannot enforce anything, the write
-    # lands, and this step reported a red against xAI for something no code of theirs could
-    # have prevented. A release gate that fails for a reason the release cannot fix gets
-    # ignored, which is the worst outcome for a security check.
+    # 6.12.96+rpt-rpi-2712 on 2026-08-09. On that kernel an older CLI let the write land and
+    # this step reported a red against xAI for something no code of theirs could have
+    # prevented. Current CLIs refuse to start instead, and that refusal is graded above,
+    # before this case. What remains here is `present`, which must
+    # hold, and `unknown`, which skips rather than inventing an expectation.
     case "$SANDBOX_MECHANISM" in
       present)
         if [ "$SBX_HELD" = "yes" ]; then
@@ -334,15 +362,6 @@ case "$(if [ "$SBX_HELD" = "untested" ]; then echo skip; else echo "$PLATFORM"; 
         else
           bad "CLI sandbox did NOT hold although the kernel offers Landlock — investigate before shipping"
         fi
-        ;;
-      absent)
-        # Not a pass and not a failure of the CLI. But it IS a finding, and it belongs in the
-        # log rather than in nobody's head: asked for a security control it could not apply,
-        # the CLI said nothing at all. Silent degradation of confinement is the same shape as
-        # the Windows case, and it means "enforced on Linux" is too strong a claim for our
-        # own documentation.
-        printf '  SKIP  CLI sandbox cannot be tested here: this kernel has no Landlock (write landed: %s, exit %s, stderr %sB). ⚠ The CLI did not warn that confinement was unavailable.
-' "$SBX_WROTE" "$SBX_EXIT" "$SBX_ERR_BYTES"
         ;;
       *)
         printf '  SKIP  CLI sandbox: could not determine whether this kernel offers Landlock — no expectation checked (write landed: %s)
@@ -357,6 +376,7 @@ case "$(if [ "$SBX_HELD" = "untested" ]; then echo skip; else echo "$PLATFORM"; 
     printf '  SKIP  CLI sandbox control: platform undetermined (write landed: %s, exit %s)\n' "$SBX_WROTE" "$SBX_EXIT"
     ;;
 esac
+fi
 
 section "2c. Control: the CLI still starts a session with our removal list"
 # WHY THIS IS SEPARATE FROM STEP 4. Step 4 runs a read-only job and goes red here too — but it
@@ -389,9 +409,10 @@ if [ -z "$TOOL_LIST" ]; then
 else
   # ⚠ The flags production actually uses, not a subset. The requirement graph is a property of
   # the WHOLE flag set — that is the argument verifyDisallowedToolIds makes about its own probe —
-  # so a 2c that omits --no-plan and the deny rules can pass a list that only dies under a real
-  # run. Read the deny rules out of the module for the same reason as the tool list: a copy here
-  # would be what gets verified. (Audit, 2026-08-08.)
+  # so a 2c that omits a flag the real run passes can pass a list that only dies under a real
+  # run. `--no-plan` is one of those flags and it is not the barrier: a headless run ignores it,
+  # and it is passed for TUI parity. Read the deny rules out of the module for the same
+  # reason as the tool list: a copy here would be what gets verified.
   DENY_ARGS=""
   DENY_LIST="$(GROK_CC_BRIDGE_URL="file:///$(cygpath -m "$BRIDGE" 2>/dev/null || echo "$BRIDGE")" node -e '
 import(process.env.GROK_CC_BRIDGE_URL).then((m) => process.stdout.write(m.READ_ONLY_DENY_RULES.join(",")))
@@ -401,35 +422,63 @@ import(process.env.GROK_CC_BRIDGE_URL).then((m) => process.stdout.write(m.READ_O
     for rule in $DENY_LIST; do DENY_ARGS="$DENY_ARGS --deny $rule"; done
     IFS="$OLD_IFS"
   fi
-  # shellcheck disable=SC2086
-  "$GROK_BIN" -p "Reply with the single word OK." --no-plan --sandbox read-only \
-    --disallowed-tools "$TOOL_LIST" $DENY_ARGS --cwd "$SBW/init" >"$SB/init.out" 2>"$SB/init.err"
-  INIT_EXIT=$?
-  # printf '%s' leaves no trailing newline, so `wc -l` counts one short — it reported "13" for
-  # a 14-id list on the first run. A gate that miscounts what it checked is a small lie in the
-  # one place that exists to be believed.
-  INIT_COUNT="$(printf '%s\n' "$TOOL_LIST" | tr ',' '\n' | wc -l | tr -d ' ')"
-  if [ "$INIT_EXIT" -eq 0 ]; then
-    # ⚠ Says exactly what exit 0 proves and no more. It proves the session STARTS with the list
-    # applied. It does not prove the ids are real — an id the CLI does not recognise is inert
-    # and starts a session perfectly happily, which is precisely why `check --verify-tools`
-    # exists as a separate question. An earlier wording here read "with all N removed ids",
-    # which invited the stronger reading.
-    ok "CLI starts a session with the $INIT_COUNT-id removal list applied (does not prove the ids are real — that is check --verify-tools)"
-  elif grep -qi 'requirements unsatisfied\|session initialization failed\|could.t create session' "$SB/init.err" "$SB/init.out"; then
-    # ⚠ BOTH STREAMS. This grepped stderr alone, so a CLI that put the requirement error on
-    # stdout — or reworded it — fell through to SKIP, and a SKIP does not increment FAIL, so the
-    # whole suite could exit 0 over a removal list that kills every read-only run. That is the
-    # same defect this step exists to catch, one stream over. verifyDisallowedToolIds already
-    # reads `stderr || stdout` for exactly this reason; acceptance knew less than the check it
-    # complements. (Audit, 2026-08-08.)
-    DEP="$(grep -ohE 'tool: \\?"[^\\"]+' "$SB/init.err" "$SB/init.out" | head -1 | sed 's/.*"//')"
-    bad "removal list breaks session init — the CLI wants ${DEP:-a dependent tool} removed too; EVERY read-only run is dead"
+  # The sandbox argument is read out of the module, the same
+  # rule as the tool list. detect_sandbox_mechanism is the wrong source here: its
+  # /boot/config fallback can answer `absent` where the bridge's detectLandlock answers
+  # `unknown` and passes `read-only`, so "the argument the bridge would pass" was false
+  # on that host. Step 2b stays keyed on the detector, because 2b is about the kernel.
+  # `off` is passed explicitly, not omitted, so a profile in the user's own Grok config
+  # or GROK_SANDBOX cannot re-introduce read-only. A managed requirement still outranks
+  # the flag (cli-1.0.45 agent/config.rs:632-643, requirement > CLI > env > config).
+  # This step proves the removal list starts a session with the argument the bridge
+  # would pass. It does not prove that Landlock held, and it does not prove the
+  # refusal — step 2b still launches with read-only and expects that refusal.
+  SANDBOX_PROFILE="$(GROK_CC_BRIDGE_URL="file:///$(cygpath -m "$BRIDGE" 2>/dev/null || echo "$BRIDGE")" node -e '
+import(process.env.GROK_CC_BRIDGE_URL).then((m) => process.stdout.write(String(m.readOnlySandboxProfile())))
+' 2>/dev/null)"
+  if [ -z "$SANDBOX_PROFILE" ]; then
+    bad "could not read readOnlySandboxProfile from the bridge — session init NOT tested"
   else
-    # Auth, allowance, a missing binary: all leave a non-zero exit and none of them is a
-    # statement about the list. An unknown must not become a finding in either direction.
-    printf '  SKIP  session-init control did not run (exit %s): %s\n' \
-      "$INIT_EXIT" "$(head -c 120 "$SB/init.err" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    "$GROK_BIN" -p "Reply with the single word OK." --no-plan --sandbox "$SANDBOX_PROFILE" \
+      --disallowed-tools "$TOOL_LIST" $DENY_ARGS --cwd "$SBW/init" >"$SB/init.out" 2>"$SB/init.err"
+    INIT_EXIT=$?
+    # printf '%s' leaves no trailing newline, so `wc -l` counts one short — it reported "13" for
+    # a 14-id list on the first run. A gate that miscounts what it checked is a small lie in the
+    # one place that exists to be believed.
+    INIT_COUNT="$(printf '%s\n' "$TOOL_LIST" | tr ',' '\n' | wc -l | tr -d ' ')"
+    INIT_OUT_BYTES=$(wc -c < "$SB/init.out" | tr -d ' ')
+    # Refusal before the pass and before SKIP. Either half of the step 2b sentence, plus
+    # the generic "could not apply the '" so a refusal of `off` is the same grade. A skip
+    # here would hide a profile this CLI will not start, and every read-only run on this
+    # host would die the same way. Exit 0 with empty stdout is not a started session.
+    if grep -F -e "could not apply the '" -e "Refusing to start with its protections missing" \
+        "$SB/init.out" "$SB/init.err" >/dev/null 2>&1; then
+      bad "CLI refused the sandbox profile the bridge passes on this host (--sandbox $SANDBOX_PROFILE), so every read-only run here dies"
+    elif [ "$INIT_EXIT" -eq 0 ] && [ "$INIT_OUT_BYTES" -gt 0 ]; then
+      # Exit 0 and non-empty stdout prove the session started and said something with this
+      # list and this profile. They do not prove the ids are real — an id the CLI does not
+      # recognise is inert and starts a session perfectly happily, which is why
+      # `check --verify-tools` exists. `off` does not prove a kernel profile held.
+      ok "CLI starts a session with the $INIT_COUNT-id removal list applied under --sandbox $SANDBOX_PROFILE (does not prove the ids are real — that is check --verify-tools; off proves the list starts a session, not that a kernel profile held)"
+    elif [ "$INIT_EXIT" -eq 0 ]; then
+      bad "exit 0 but no output, session start not proven"
+    elif grep -qi 'requirements unsatisfied\|session initialization failed\|could.t create session' "$SB/init.err" "$SB/init.out"; then
+      # ⚠ BOTH STREAMS. This grepped stderr alone, so a CLI that put the requirement error on
+      # stdout — or reworded it — fell through to SKIP, and a SKIP does not increment FAIL, so the
+      # whole suite could exit 0 over a removal list that kills every read-only run. That is the
+      # same defect this step exists to catch, one stream over. verifyDisallowedToolIds already
+      # reads `stderr || stdout` for exactly this reason; acceptance knew less than the check it
+      # complements.
+      DEP="$(grep -ohE 'tool: \\?"[^\\"]+' "$SB/init.err" "$SB/init.out" | head -1 | sed 's/.*"//')"
+      bad "removal list breaks session init — the CLI wants ${DEP:-a dependent tool} removed too; EVERY read-only run is dead"
+    else
+      # Auth, allowance, a missing binary: all leave a non-zero exit and none of them is a
+      # statement about the list. An unknown must not become a finding in either direction.
+      # A sandbox refusal does not reach here: it was graded bad above.
+      printf '  SKIP  session-init control did not run (exit %s): %s\n' \
+        "$INIT_EXIT" "$(head -c 120 "$SB/init.err" | tr '\n' ' ')"
+    fi
   fi
 fi
 

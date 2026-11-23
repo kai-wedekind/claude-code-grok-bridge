@@ -9,9 +9,9 @@
  * there is no quota endpoint anywhere to reconcile it against: this record is the only view of
  * what a run cost.
  *
- * ⚠ It undercounts hardest where it matters most. The nudge fires when a turn was spent and no
- * text came back — which is exactly what exhausting `--max-turns` produces. The most expensive
- * failures were the most under-reported.
+ * The nudge fires when a turn exited 0 and no text came back. Exhausting `--max-turns` is
+ * not that case: the CLI prints a result envelope, writes "Error: max turns reached" on
+ * stderr, and exits 1, so the nudge does not run.
  *
  * Measured 2026-08-09 before the fix: 2 launches, `usage` 10/5/15, `numTurns` 2,
  * `usageIncomplete` false. Found by an architectural review of the whole project, not by the
@@ -76,4 +76,42 @@ test("a nudged run records the spend of BOTH launches", () => {
   // And because both attempts reported usage, the total is genuinely complete — this must NOT
   // become "mark everything incomplete", which would trade a wrong number for a useless one.
   assert.equal(payload.usageIncomplete, false, "both launches were measured, so this is complete");
+});
+
+test("a nudge keeps usageIncomplete from a cost_is_partial first launch", () => {
+  const { payload, launches } = nudgedRun("cost-partial-then-text");
+
+  assert.equal(launches, 2);
+  assert.equal(payload.nudged, true);
+  assert.equal(payload.usage.input_tokens, 11);
+  assert.equal(payload.usage.total_tokens, 20);
+  assert.equal(payload.usageIncomplete, true, "the first launch withheld its cost");
+  assert.equal(payload.costTicks, null);
+});
+
+// A launch that reported no usage block at all cannot be summed honestly: the total is the
+// retry's alone and the run has to say so. Every other fixture here has usage on both launches,
+// so this is the one test that reads spendIncomplete.
+test("a nudge whose first launch reported no usage at all is recorded as incomplete", () => {
+  const { payload, launches } = nudgedRun("empty-no-usage-then-ok");
+
+  assert.equal(launches, 2);
+  assert.equal(payload.nudged, true);
+  assert.equal(payload.delivered, true);
+  assert.equal(payload.usage.total_tokens, 4, "only the retry reported usage, so only it is summed");
+  assert.equal(payload.usageIncomplete, true, "the first launch was never measured");
+});
+
+test("a nudge whose unpriced launch is followed by a priced one stays incomplete", () => {
+  const { payload, launches } = nudgedRun("usage-no-cost-then-priced");
+
+  assert.equal(launches, 2);
+  assert.equal(payload.nudged, true);
+  assert.equal(payload.usage.total_tokens, 13);
+  assert.equal(payload.costTicks, 5000);
+  assert.equal(
+    payload.usageIncomplete,
+    true,
+    "the summed ticks are only the retry; the first launch reported usage and no cost"
+  );
 });

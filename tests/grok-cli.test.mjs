@@ -131,6 +131,27 @@ test("buildHeadlessArgs applies executeTaskRun read-only and write option object
 // the real CLI had already dropped in 0.2.118, and reported it working. A fixture that
 // implements more than the thing it stands in for does not test a contract, it invents one.
 
+test("a prompt whose first character is '-' is handed over as a file", async () => {
+  // cli.rs:471-479: --single / -p has no allow_hyphen_values, so clap reads a leading
+  // dash as a flag. Long prompts already travel as --prompt-file.
+  const binDir = makeTempDir();
+  installFakeGrok(binDir);
+  const env = buildEnv(binDir);
+  const cwd = makeTempDir();
+  const bullets = "- item one\n- item two";
+
+  const dashed = await runHeadlessAgent(cwd, { prompt: bullets, env, globalSlot: false });
+  assert.equal(dashed.args.includes("-p"), false);
+  assert.equal(dashed.args.includes(bullets), false);
+  assert.ok(dashed.args.includes("--prompt-file"));
+  assert.equal(dashed.status, 0);
+
+  const plain = await runHeadlessAgent(cwd, { prompt: "check the thing", env, globalSlot: false });
+  assert.ok(plain.args.includes("-p"));
+  assert.equal(plain.args[plain.args.indexOf("-p") + 1], "check the thing");
+  assert.equal(plain.args.includes("--prompt-file"), false);
+});
+
 test("parseStructuredOutput extracts fenced JSON", () => {
   const raw = 'Here you go:\n```json\n{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}\n```\n';
   const parsed = parseStructuredOutput(raw);

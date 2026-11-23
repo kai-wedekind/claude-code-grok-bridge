@@ -510,9 +510,14 @@ export function buildStatusSnapshot(cwd, options = {}) {
   const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
 
-  const recent = (options.all || options.allSessions ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
-    .map((job) => enrichJob(job, { maxProgressLines }));
+  // Filter before the cap: active runs sort newest-first, so capping the full list let them
+  // fill the window and hid every older finished run (upstream #70).
+  const finished = jobs.filter(
+    (job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id
+  );
+  const recent = (options.all || options.allSessions ? finished : finished.slice(0, maxJobs)).map((job) =>
+    enrichJob(job, { maxProgressLines })
+  );
 
   return {
     workspaceRoot,

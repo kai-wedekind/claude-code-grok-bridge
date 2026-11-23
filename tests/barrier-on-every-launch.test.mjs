@@ -9,6 +9,14 @@
  * Sharing a helper is a reason to expect it to hold, not evidence that it does. These tests
  * assert the flags on the launches nobody was looking at, so the sentence in the security
  * document is a claim the suite can actually cash.
+ *
+ * The sandbox profile is a literal, never `readOnlySandboxProfile()`.
+ * Comparing with the function under test stays green when every launch passes `off`, and a
+ * hard-coded `"read-only"` at one site stays green on a host whose own answer is `read-only`.
+ * The walk therefore runs twice on a forced Linux answer: `present` expects `read-only` on
+ * every read-only launch, `absent` expects `off`. Only the absent walk tells a hard-coded
+ * `"read-only"` at one site from the real code. Write launches assert that no `--sandbox`
+ * is passed.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -36,8 +44,16 @@ function launches(argvLogPath) {
     .map((l) => JSON.parse(l));
 }
 
+function probeEnv(binDir, argvLog, probe) {
+  return pluginDataEnv(makeTempDir(), binDir, {
+    GROK_FAKE_ARGV_LOG: argvLog,
+    GROK_CC_LANDLOCK_PROBE: probe,
+    GROK_CC_CONFINEMENT_PLATFORM: "linux"
+  });
+}
+
 /** The barrier, asserted positively rather than by absence of the write flag. */
-function assertBarrier(argv, label) {
+function assertBarrier(argv, label, expectedSandbox) {
   const joined = argv.join(" ");
   const idx = argv.indexOf("--disallowed-tools");
   assert.ok(idx !== -1, `${label}: --disallowed-tools missing from argv: ${joined}`);
@@ -49,62 +65,90 @@ function assertBarrier(argv, label) {
     assert.ok(joined.includes(`--deny ${rule}`), `${label}: deny rule ${rule} missing — argv: ${joined}`);
   }
   assert.ok(!joined.includes("--always-approve"), `${label}: read-only must not auto-approve — argv: ${joined}`);
+  // The sandbox flag is checked too, and the expected profile is a literal, not the
+  // function the launch calls.
+  const sandbox = argv.indexOf("--sandbox");
+  assert.ok(
+    sandbox !== -1 && argv[sandbox + 1] === expectedSandbox,
+    `${label}: --sandbox ${expectedSandbox} missing — argv: ${joined}`
+  );
+  // Passed, not enforcing. A headless run ignores `--no-plan`;
+  // the assertion only checks that the argv still carries it.
+  assert.ok(argv.includes("--no-plan"), `${label}: --no-plan missing — argv: ${joined}`);
 }
 
-test("the nudge's second launch carries the barrier too, not just the first", () => {
-  // The nudge re-launches the CLI after an empty deliverable. The existing test counts that
-  // there were two launches; it never looked at what the second one was made of. A retry that
-  // dropped the barrier would have passed it.
-  const binDir = makeTempDir();
-  installFakeGrok(binDir, "empty-text");
-  const pluginDataDir = makeTempDir();
-  const workspace = makeTempDir();
-  const argvLog = path.join(makeTempDir(), "argv.log");
-  const env = pluginDataEnv(pluginDataDir, binDir, { GROK_FAKE_ARGV_LOG: argvLog });
+function assertNoSandbox(argv, label) {
+  assert.equal(
+    argv.indexOf("--sandbox"),
+    -1,
+    `${label}: write launch must not pass --sandbox — argv: ${argv.join(" ")}`
+  );
+}
 
-  run(process.execPath, [SCRIPT, "run", "--cwd", workspace, "say nothing"], { env });
+/**
+ * Nudge, review, critique and `check --verify-tools` are different call sites. The nudge
+ * is the task site (`run`, connector and the background worker use the same expression).
+ * Review and critique share one site. verify-tools is its own. A literal at any one of
+ * them survives a walk that does not launch it.
+ */
+function walkLaunches(probe, expectedSandbox) {
+  const label = `probe ${probe}`;
 
-  const all = launches(argvLog);
-  assert.ok(all.length >= 2, `expected a nudge relaunch, saw ${all.length} launch(es)`);
-  all.forEach((argv, i) => assertBarrier(argv, `launch ${i + 1} of ${all.length}`));
+  const nudgeBin = makeTempDir();
+  installFakeGrok(nudgeBin, "empty-text");
+  const nudgeLog = path.join(makeTempDir(), "argv.log");
+  const nudgeWorkspace = makeTempDir();
+  run(process.execPath, [SCRIPT, "run", "--cwd", nudgeWorkspace, "say nothing"], {
+    env: probeEnv(nudgeBin, nudgeLog, probe)
+  });
+  const nudge = launches(nudgeLog);
+  assert.ok(nudge.length >= 2, `${label}: expected a nudge relaunch, saw ${nudge.length} launch(es)`);
+  nudge.forEach((argv, i) => assertBarrier(argv, `${label} nudge launch ${i + 1} of ${nudge.length}`, expectedSandbox));
+
+  for (const command of ["review", "critique"]) {
+    const binDir = makeTempDir();
+    installFakeGrok(binDir);
+    const workspace = makeTempDir();
+    initGitRepo(workspace);
+    // A review of nothing launches nothing: with no working-tree change the command exits
+    // before it ever builds argv, and an "at least one launch" assertion then fails for a
+    // reason that has nothing to do with the barrier.
+    fs.writeFileSync(path.join(workspace, "changed.txt"), "a line worth reviewing\n", "utf8");
+    const argvLog = path.join(makeTempDir(), "argv.log");
+    run(process.execPath, [SCRIPT, command, "--cwd", workspace], {
+      env: probeEnv(binDir, argvLog, probe)
+    });
+    const all = launches(argvLog);
+    assert.ok(all.length >= 1, `${label}: ${command} must have launched the CLI at least once`);
+    all.forEach((argv, i) => assertBarrier(argv, `${label} ${command} launch ${i + 1}`, expectedSandbox));
+  }
+
+  const checkBin = makeTempDir();
+  installFakeGrok(checkBin);
+  const checkLog = path.join(makeTempDir(), "argv.log");
+  run(process.execPath, [SCRIPT, "check", "--verify-tools", "--cwd", makeTempDir()], {
+    env: probeEnv(checkBin, checkLog, probe)
+  });
+  const probed = launches(checkLog).filter((argv) => argv.includes("--disallowed-tools"));
+  assert.ok(probed.length >= 1, `${label}: verify-tools must have launched the removal-list probe`);
+  probed.forEach((argv, i) => assertBarrier(argv, `${label} verify-tools launch ${i + 1}`, expectedSandbox));
+
+  const writeBin = makeTempDir();
+  installFakeGrok(writeBin);
+  const writeLog = path.join(makeTempDir(), "argv.log");
+  const writeWorkspace = makeTempDir();
+  run(process.execPath, [SCRIPT, "run", "--write", "--cwd", writeWorkspace, "change this"], {
+    env: probeEnv(writeBin, writeLog, probe)
+  });
+  const writeLaunches = launches(writeLog).filter((argv) => argv.includes("-p") || argv.includes("--prompt-file"));
+  assert.ok(writeLaunches.length >= 1, `${label}: write run must have launched`);
+  writeLaunches.forEach((argv, i) => assertNoSandbox(argv, `${label} write launch ${i + 1}`));
+}
+
+test("every read-only launch passes --sandbox read-only when the probe says present", () => {
+  walkLaunches("present", "read-only");
 });
 
-test("review builds the same barrier as run", () => {
-  const binDir = makeTempDir();
-  installFakeGrok(binDir);
-  const pluginDataDir = makeTempDir();
-  const workspace = makeTempDir();
-  initGitRepo(workspace);
-  // A review of nothing launches nothing: with no working-tree change the command exits before
-  // it ever builds argv, and an "at least one launch" assertion then fails for a reason that
-  // has nothing to do with the barrier. Give it something to look at.
-  fs.writeFileSync(path.join(workspace, "changed.txt"), "a line worth reviewing\n", "utf8");
-  const argvLog = path.join(makeTempDir(), "argv.log");
-  const env = pluginDataEnv(pluginDataDir, binDir, { GROK_FAKE_ARGV_LOG: argvLog });
-
-  run(process.execPath, [SCRIPT, "review", "--cwd", workspace], { env });
-
-  const all = launches(argvLog);
-  assert.ok(all.length >= 1, "review must have launched the CLI at least once");
-  all.forEach((argv, i) => assertBarrier(argv, `review launch ${i + 1}`));
-});
-
-test("critique builds the same barrier as run", () => {
-  const binDir = makeTempDir();
-  installFakeGrok(binDir);
-  const pluginDataDir = makeTempDir();
-  const workspace = makeTempDir();
-  initGitRepo(workspace);
-  // A review of nothing launches nothing: with no working-tree change the command exits before
-  // it ever builds argv, and an "at least one launch" assertion then fails for a reason that
-  // has nothing to do with the barrier. Give it something to look at.
-  fs.writeFileSync(path.join(workspace, "changed.txt"), "a line worth reviewing\n", "utf8");
-  const argvLog = path.join(makeTempDir(), "argv.log");
-  const env = pluginDataEnv(pluginDataDir, binDir, { GROK_FAKE_ARGV_LOG: argvLog });
-
-  run(process.execPath, [SCRIPT, "critique", "--cwd", workspace], { env });
-
-  const all = launches(argvLog);
-  assert.ok(all.length >= 1, "critique must have launched the CLI at least once");
-  all.forEach((argv, i) => assertBarrier(argv, `critique launch ${i + 1}`));
+test("every read-only launch passes --sandbox off when the probe says absent", () => {
+  walkLaunches("absent", "off");
 });

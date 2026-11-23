@@ -403,9 +403,20 @@ function appendReasoningSection(lines, reasoningSummary) {
 }
 
 export function renderSetupReport(report) {
-  const lines = [
-    "# Grok Build Check",
-    "",
+  const lines = ["# Grok Build Check", ""];
+
+  // ⚠ FIRST, above Status, above everything — this is not one more fact about the setup, it
+  // is whether anything below can spend money at all. A reader scanning top to bottom must
+  // see it before "ready" or not at all.
+  if (report.disabled) {
+    lines.push(
+      `🚫 DISABLED: ${report.disabled.reason}`,
+      `   since ${report.disabled.disabledAt} — re-enable with: node grok-bridge.mjs enable`,
+      ""
+    );
+  }
+
+  lines.push(
     `Status: ${report.ready ? "ready" : "needs attention"}`,
     "",
     "Checks:",
@@ -414,7 +425,7 @@ export function renderSetupReport(report) {
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
     ""
-  ];
+  );
 
   // Only present when --verify-tools asked for it, because finding out costs a real run.
   // ⚠ Three outcomes, and they must stay three. "Could not check" is not "fine": this list is
@@ -552,8 +563,14 @@ const FAILURE_HEADLINES = {
   "output-truncated": "The output exceeded the capture limit and was cut off, so the result is incomplete.",
   "no-deliverable": "Grok returned no output.",
   "schema-parse": "Grok did not return valid structured JSON.",
+  "connector-unavailable":
+    "The connector catalog never loaded in this run, so nothing reached the connector and the reply is not about it. Running it again is safe and usually works.",
+  "connector-refused":
+    "A connector call outside this run's allow rules was refused, which ends the run at once, so nothing planned after it ran. Running it again gets the same refusal.",
+  // No status in the headline: a 402, a 403 credit refusal and free-usage exhaustion all
+  // land here, and the progress line names the one that happened.
   "quota-exhausted":
-    "Grok refused the run for quota reasons (HTTP 402), so it stopped before producing a result. " +
+    "Grok refused the run for quota reasons, so it stopped before producing a result. " +
     "Whether retrying helps depends on the account: an allowance that has to reset, or credit that can be topped up.",
   // The one that was missing, and the most expensive omission of the set: an expired
   // session fell through to the default line and told the reader their JSON was malformed.
@@ -561,7 +578,10 @@ const FAILURE_HEADLINES = {
   // — they are exactly the failures where doing the same thing again cannot work, so the
   // headline is the only thing that tells the reader to do something else.
   "not-authenticated":
-    "Nobody is signed in, so the run stopped before producing a result. Sign in with `grok login --device-code` or set XAI_API_KEY."
+    "Nobody is signed in, so the run stopped before producing a result. Sign in with `grok login --device-code` or set XAI_API_KEY.",
+  // Exit 1 with a finished envelope, not an empty exit 0. The text under this line is
+  // the partial answer; re-running hits the same --max-turns limit.
+  "max-turns": "Grok ran out of turns before finishing; the text so far is below."
 };
 
 /**
@@ -739,6 +759,12 @@ export function renderTaskResult(parsedResult, meta) {
   // same words twice — the cause right, the evidence a copy of it. The other call sites
   // already guarded on this; these two did not.
   const detail = headline && failure && failure !== headline ? failure : "";
+  // A failed run keeps its warnings: "the session history was not checked", a
+  // refused-and-continued count and the confinement disclosure must reach a caller who reads
+  // stdout too. A warning the failure text already carries is not printed twice.
+  const failureWarnings = failure ? warnings.filter((entry) => !failure.includes(entry)) : [];
+  const failureWarningBlock =
+    failureWarnings.length > 0 ? `\n[grok-cc] Warning: ${failureWarnings.join(" ")}` : "";
 
   if (rawOutput) {
     const body = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
@@ -746,8 +772,8 @@ export function renderTaskResult(parsedResult, meta) {
     // left callers unable to tell a non-zero exit from a successful one.
     if (failure) {
       return headline
-        ? `[grok-cc] Run did not succeed: ${headline}\n\n${body}${detail ? `\n[grok-cc] Details: ${detail}` : ""}${usageSuffix || "\n"}`
-        : `${body}\n[grok-cc] Run did not succeed: ${failure}${usageSuffix || "\n"}`;
+        ? `[grok-cc] Run did not succeed: ${headline}\n\n${body}${detail ? `\n[grok-cc] Details: ${detail}` : ""}${failureWarningBlock}${usageSuffix || "\n"}`
+        : `${body}\n[grok-cc] Run did not succeed: ${failure}${failureWarningBlock}${usageSuffix || "\n"}`;
     }
     if (warningLine) {
       return `${body}\n${warningLine}${usageSuffix}`;
@@ -757,8 +783,8 @@ export function renderTaskResult(parsedResult, meta) {
 
   if (failure) {
     return headline
-      ? `[grok-cc] Run did not succeed: ${headline}${detail ? `\n\n[grok-cc] Details: ${detail}` : ""}${usageSuffix || "\n"}`
-      : `${failure}${usageSuffix || "\n"}`;
+      ? `[grok-cc] Run did not succeed: ${headline}${detail ? `\n\n[grok-cc] Details: ${detail}` : ""}${failureWarningBlock}${usageSuffix || "\n"}`
+      : `${failure}${failureWarningBlock}${usageSuffix || "\n"}`;
   }
   if (warningLine) {
     return `${warningLine}${usageSuffix}`;

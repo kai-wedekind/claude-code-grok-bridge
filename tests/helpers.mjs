@@ -6,6 +6,18 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// Claude Code exports CLAUDE_PLUGIN_DATA into the shell that runs the suite, and
+// GROK_BUILD_PLUGIN_DATA is the plugin-owned name proposed upstream. Either one, inherited,
+// sends job state into a live plugin data directory (upstream #52, 2026-10-24). Tests that
+// need a data directory set it themselves after this point.
+delete process.env.CLAUDE_PLUGIN_DATA;
+delete process.env.GROK_BUILD_PLUGIN_DATA;
+// The same for the bridge's own markers. A suite run inside a Grok session the bridge started
+// inherits GROK_CC_BRIDGE_CHILD=1, and every hook test then sees its hook exit at once
+// (11 failures, measured 2026-10-24); GROK_CC_SESSION_ID would hand the hook a real session.
+delete process.env.GROK_CC_BRIDGE_CHILD;
+delete process.env.GROK_CC_SESSION_ID;
+
 // Every directory this process created, so cleanup can remove exactly those.
 //
 // ⚠ ONLY OUR OWN PATHS, never a glob sweep of the prefix. The prefix is inherited from upstream

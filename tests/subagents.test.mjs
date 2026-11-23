@@ -108,7 +108,9 @@ test("readSubagentStrands returns every strand in spawn order", () => {
     "order must come from started_at, not from readdir"
   );
   assert.equal(strands[0].model, "grok-4.5");
-  assert.equal(strands[0].capabilityMode, "read-only");
+  // meta.json in the plant still carries capability_mode, and the reader must not
+  // surface it. SubagentMeta never persists the field (cli-1.0.45 mod.rs:2101-2154).
+  assert.equal("capabilityMode" in strands[0], false);
   assert.equal(strands[0].toolCalls, 7);
   assert.equal(strands[0].outputChars, 1);
   assert.equal(strands[0].truncated, false);
@@ -138,7 +140,7 @@ test("a strand marked completed with no deliverable is reported, never dropped",
 });
 
 test("a failed strand with no output is not treated as an error", () => {
-  // 44 % of real strands fail (F16). A failure that produced nothing is the expected
+  // 44 % of real strands fail. A failure that produced nothing is the expected
   // shape of a failure, so flagging it as a read error would bury the ones that matter.
   const home = makeTempDir();
   const dir = plantSession(home, "C:\\p", "s", [{ id: "f", status: "failed" }]);

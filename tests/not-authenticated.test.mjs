@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { makeTempDir, run } from "./helpers.mjs";
-import { looksLikeAuthFailure } from "../plugins/grok-build/scripts/lib/grok.mjs";
+import { getGrokAuthStatus, looksLikeAuthFailure } from "../plugins/grok-build/scripts/lib/grok.mjs";
 import { scrubSecrets } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -96,6 +96,34 @@ test("the observed denial needs the probe threshold, not the default one", () =>
   // Nonsense thresholds fall back to the safe default rather than classifying everything.
   assert.equal(looksLikeAuthFailure(observed, { minHints: 0 }), false);
   assert.equal(looksLikeAuthFailure(observed, { minHints: "1" }), false);
+});
+
+test("the four grok models success banners are signed in, including an API key", () => {
+  // models.rs:12-17. The API-key line is the one the hint scan would refuse: it
+  // contains XAI_API_KEY, and the probe counts a single hint. The other three do not
+  // match that scan; they are pinned so a later hint cannot flip them.
+  const cases = [
+    ["models-api-key", "You are using XAI_API_KEY."],
+    ["models-own-api-key", "Model 'fake-model' is using its own API key."],
+    ["models-deployment-key", "You are authenticated via deployment key."],
+    ["default", "You are logged in with grok.com."]
+  ];
+  for (const [scenario, banner] of cases) {
+    const binDir = makeTempDir();
+    installFakeGrok(binDir, scenario);
+    const auth = getGrokAuthStatus(makeTempDir(), { env: buildEnv(binDir) });
+    assert.equal(auth.loggedIn, true, banner);
+    assert.match(auth.detail, new RegExp(banner.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "models-api-key");
+  const check = run(process.execPath, [SCRIPT, "check", "--cwd", makeTempDir(), "--json"], {
+    env: buildEnv(binDir, { CLAUDE_PLUGIN_DATA: makeTempDir() })
+  });
+  const report = JSON.parse(check.stdout);
+  assert.equal(report.auth.loggedIn, true, "an API-key sign-in must not be told to sign in");
+  assert.match(report.auth.detail, /You are using XAI_API_KEY/);
 });
 
 test("check does not report ready when the models probe exits 0 but denies the session", () => {

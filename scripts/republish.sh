@@ -62,7 +62,21 @@ printf 'version     : %s\n\n' "$VERSION"
 BRANCH="$(git -C "$PUB" rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || fail "publication repo is on '$BRANCH', not main"
 
-WORK_TREE="$(git -C "$WORK" rev-parse 'HEAD^{tree}')"
+# ⚠ NO PRIVATE DATA LEAVES THIS MACHINE. The gate scans the exact tree about to be published,
+# in the dry run as well, with generic rules plus a private deny-list that must live OUTSIDE
+# this tree (it lists what must not be published) and is named by GROK_CC_PRIVATE_DENYLIST.
+# Without it the script stops rather than checking less. Run from $WORK with a relative script
+# path, for the same reason the version is read with sed above: node cannot resolve an MSYS
+# /c/... path.
+#
+# ⚠ ONE COMMIT, NAMED ONCE. Everything below uses $SHA, never `HEAD`: a commit landing in the
+# working repo between the gate and the fetch would otherwise publish a tree nobody scanned.
+SHA="$(git -C "$WORK" rev-parse --verify 'HEAD^{commit}')" || fail "could not resolve the working HEAD"
+[ -n "${GROK_CC_PRIVATE_DENYLIST:-}" ] || fail "set GROK_CC_PRIVATE_DENYLIST to the private deny-list file before publishing" 7
+(cd "$WORK" && node scripts/check-private-data.mjs --tree "$SHA" --denylist "$GROK_CC_PRIVATE_DENYLIST" --require-denylist) \
+  || fail "private-data gate failed - nothing was touched; fix the findings above and commit first" 7
+
+WORK_TREE="$(git -C "$WORK" rev-parse "$SHA^{tree}")"
 PUB_TREE_BEFORE="$(git -C "$PUB" rev-parse 'HEAD^{tree}')"
 
 if [ "$WORK_TREE" = "$PUB_TREE_BEFORE" ]; then
@@ -96,12 +110,12 @@ fi
 # resolution, no filesystem round-trip, modes and content carried by the object itself. The tree
 # equality below is then true by construction - which is a reason to keep asserting it, not to
 # stop.
-git -C "$PUB" fetch --no-tags --quiet "$WORK" HEAD || fail "could not fetch the working HEAD into the publication repo"
+git -C "$PUB" fetch --no-tags --quiet "$WORK" "$SHA" || fail "could not fetch $SHA into the publication repo"
 
 # --reset -u makes the index AND the working tree match that tree exactly: files added, files
 # removed, modes as recorded. It is a hard reset of the content without moving HEAD, so the
 # release still becomes one deliberate commit on top of the previous release.
-git -C "$PUB" read-tree --reset -u FETCH_HEAD || fail "read-tree failed; the publication repo is untouched"
+git -C "$PUB" read-tree --reset -u "$WORK_TREE" || fail "read-tree failed; the publication repo is untouched"
 
 # ⚠ VERIFY BEFORE COMMITTING, not after. Once the commit exists the wrong tree is in history.
 STAGED_TREE="$(git -C "$PUB" write-tree)"
@@ -112,7 +126,9 @@ if [ "$STAGED_TREE" != "$WORK_TREE" ]; then
 fi
 
 printf '= IDENTICAL (tree %s)\n' "$WORK_TREE"
-printf '\nStaged in %s. Commit it with a written message file:\n' "$PUB"
+printf '\nStaged in %s. Check the commit and tag message files with the same gate first:\n' "$PUB"
+printf '  node scripts/check-private-data.mjs --message <commit-message> --message <tag-message> --denylist "$GROK_CC_PRIVATE_DENYLIST" --require-denylist\n'
+printf 'then commit with the written message file:\n'
 printf '  git -C "%s" commit -F <path-to-message>\n' "$PUB"
 printf '\nNot committed here on purpose: the commit is signed and its message is the public\n'
 printf 'release announcement, so it is written deliberately rather than generated.\n'

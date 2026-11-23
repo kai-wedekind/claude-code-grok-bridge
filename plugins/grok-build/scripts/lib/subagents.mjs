@@ -302,7 +302,8 @@ export function readSubagentStrands(sessionDir, options = {}) {
       toolCalls: Number.isFinite(meta?.tool_calls) ? meta.tool_calls : null,
       turns: Number.isFinite(meta?.turns) ? meta.turns : null,
       model: typeof meta?.effective_model_id === "string" ? meta.effective_model_id : null,
-      capabilityMode: typeof meta?.capability_mode === "string" ? meta.capability_mode : null,
+      // SubagentMeta never persists capability_mode (cli-1.0.45
+      // agent/subagent/mod.rs:2101-2154). The field lived only on the GCS artifact.
       output,
       outputChars,
       truncated,

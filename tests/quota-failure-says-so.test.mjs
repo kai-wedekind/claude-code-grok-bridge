@@ -8,6 +8,7 @@ import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { parseCliErrorPayload } from "../plugins/grok-build/scripts/lib/grok.mjs";
 import {
+  failureHeadline,
   renderNativeReviewResult,
   renderStoredJobResult,
   renderTaskResult
@@ -124,6 +125,15 @@ test("the last progress line names the cause once the cause is known", () => {
   // of this fix actually repaired.
   assert.match(stored.lastMessage, /exhausted|402/i);
   assert.doesNotMatch(stored.lastMessage, /exited with status/i);
+});
+
+// The headline is shared by a
+// 402, a 403 credit refusal and free-usage exhaustion, so it names no HTTP status; the progress
+// line carries the status that happened.
+test("the quota-exhausted headline names no HTTP status", () => {
+  const headline = failureHeadline("quota-exhausted");
+  assert.match(headline, /refused the run for quota reasons/i);
+  assert.doesNotMatch(headline, /HTTP|\b40[0-9]\b/i);
 });
 
 // --- the general case: the complaint was never only about 402 ---

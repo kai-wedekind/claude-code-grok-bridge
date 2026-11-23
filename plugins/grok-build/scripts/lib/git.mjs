@@ -240,7 +240,17 @@ export function detectDefaultBranch(cwd) {
   if (symbolic.status === 0) {
     const remoteHead = symbolic.stdout.trim();
     if (remoteHead.startsWith("refs/remotes/origin/")) {
-      return remoteHead.replace("refs/remotes/origin/", "");
+      // The bare name resolves only when a local branch of that name exists, which it does not
+      // after `git clone --branch <feature>`, and then `merge-base` failed. Use the
+      // remote-tracking ref in that case, and fall through to the candidates when origin/HEAD
+      // names a branch that was deleted on the remote (upstream #66).
+      const name = remoteHead.slice("refs/remotes/origin/".length);
+      if (git(cwd, ["show-ref", "--verify", "--quiet", `refs/heads/${name}`]).status === 0) {
+        return name;
+      }
+      if (git(cwd, ["show-ref", "--verify", "--quiet", remoteHead]).status === 0) {
+        return `origin/${name}`;
+      }
     }
   }
 
@@ -299,11 +309,14 @@ export function getWorkingTreeState(cwd) {
 }
 
 export function resolveReviewTarget(cwd, options = {}) {
-  ensureGitRepository(cwd);
+  const repoRoot = ensureGitRepository(cwd);
 
   const requestedScope = options.scope ?? "auto";
   const baseRef = options.base ?? null;
-  const state = getWorkingTreeState(cwd);
+  // From the root, not from cwd: `git ls-files --others` lists only untracked files under the
+  // directory it runs in, so a review started in a subdirectory saw a clean tree and reviewed
+  // the branch diff instead (upstream #67). collectReviewContext already reads from the root.
+  const state = getWorkingTreeState(repoRoot);
   const supportedScopes = new Set(["auto", "working-tree", "branch"]);
 
   // A base ref reaches git POSITIONALLY, with no option terminator, so a value beginning with a

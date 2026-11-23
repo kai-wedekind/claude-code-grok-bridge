@@ -11,7 +11,7 @@
  * outbound network request — was silently absent, along with eight other user-visible items.
  * It took two rounds of human correction to find that.
  *
- * The rule, from Kai, 2026-08-09: **everything on the roadmap goes into the changelog, except a
+ * The rule, set 2026-08-09: **everything on the roadmap goes into the changelog, except a
  * bug freshly introduced by that same roadmap work. A new feature can never be missed.**
  *
  * So the source of truth is the roadmap, not recollection, and this makes that mechanical.

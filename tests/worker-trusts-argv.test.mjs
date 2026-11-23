@@ -94,6 +94,36 @@ test("worker refuses a record whose id does not match the requested job", () => 
   );
 });
 
+test("worker takes write mode from argv, never from the record", () => {
+  // A worker that also honoured `request.write` would pass every other test. A record anyone
+  // running as this user can edit must not be able to turn a read-only run into a write run.
+  const binDir = makeTempDir();
+  installFakeGrok(binDir);
+  const pluginDataDir = makeTempDir();
+  const workspace = makeTempDir();
+  const argvLog = path.join(makeTempDir(), "argv.log");
+  const env = buildEnv(binDir, { CLAUDE_PLUGIN_DATA: pluginDataDir, GROK_FAKE_ARGV_LOG: argvLog });
+
+  const jobId = "run-argvtest-dddd";
+  withStateRoot(pluginDataDir, () => {
+    seedQueuedJob(workspace, jobId, { prompt: "hello", cwd: workspace, write: true });
+  });
+
+  const result = run(process.execPath, [SCRIPT, "run-worker", "--cwd", workspace, "--job-id", jobId], { env });
+  assert.equal(result.status, 0, result.stderr);
+  const launches = fs
+    .readFileSync(argvLog, "utf8")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line))
+    .filter((argv) => argv.includes("-p") || argv.includes("--prompt-file"));
+  assert.ok(launches.length >= 1, "the worker must have launched the CLI");
+  for (const argv of launches) {
+    assert.ok(!argv.includes("--always-approve"), `the record's write:true must not reach the CLI — ${argv.join(" ")}`);
+    assert.ok(argv.includes("--disallowed-tools"), `the read-only barrier must still be there — ${argv.join(" ")}`);
+  }
+});
+
 test("worker runs in the cwd from argv, not the one stored in the record", () => {
   const binDir = makeTempDir();
   installFakeGrok(binDir, "echo-cwd");

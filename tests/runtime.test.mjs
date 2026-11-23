@@ -59,7 +59,14 @@ test("read-only runs carry the write barrier, write runs do not", () => {
   const pluginDataDir = makeTempDir();
   const workspace = makeTempDir();
   const argvLog = path.join(makeTempDir(), "argv.log");
-  const env = pluginDataEnv(pluginDataDir, binDir, { GROK_FAKE_ARGV_LOG: argvLog });
+  // Pin the launch whose argv is asserted. The expectation is
+  // the literal `read-only`; calling readOnlySandboxProfile() would grade that function
+  // against itself. The write half below does not read the confinement record.
+  const env = pluginDataEnv(pluginDataDir, binDir, {
+    GROK_FAKE_ARGV_LOG: argvLog,
+    GROK_CC_LANDLOCK_PROBE: "present",
+    GROK_CC_CONFINEMENT_PLATFORM: "linux"
+  });
 
   const readOnly = run(process.execPath, [SCRIPT, "run", "--cwd", workspace, "inspect this"], { env });
   assert.equal(readOnly.status, 0, readOnly.stderr);
@@ -98,8 +105,9 @@ test("read-only runs carry the write barrier, write runs do not", () => {
     /--always-approve/,
     "a read-only run must never carry blanket approval"
   );
-  // Never set on either path (`permissionMode: undefined`); read-only is enforced by tool
-  // removal and deny rules instead, because plan mode dead-ends headless.
+  // Never set on either path (`permissionMode: undefined`). Read-only is tool removal and
+  // deny rules. `--no-plan` is passed (asserted above) and does not enforce this: a headless
+  // run ignores it.
   assert.doesNotMatch(
     readOnlyJoined,
     /--permission-mode/,

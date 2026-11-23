@@ -25,8 +25,8 @@ on:
       - '.github/ISSUE_TEMPLATE/**'
       - 'docs/**'
   # Run it by hand from the Actions tab. Useful when the suite has not run against a
-  # commit for a reason unrelated to the code — a docs-only push, or a period when the
-  # account's runner minutes were exhausted — and the tree deserves a verdict anyway.
+  # commit for a reason unrelated to the code — a docs-only push, for instance — and the
+  # tree deserves a verdict anyway.
   workflow_dispatch:
 
 # Least privilege, stated rather than inherited. On a public repository the default

@@ -5,7 +5,7 @@ disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
-Run a Grok Build review through the plugin bridge (read-only write barrier: `--no-plan`, `--sandbox read-only`, disallowed write tools, and deny rules — not plan mode).
+Run a Grok Build review through the plugin bridge (read-only write barrier: `--sandbox read-only`, except `off` on a Linux kernel without Landlock, where tool removal and deny rules are the whole barrier; disallowed write tools and deny rules — not plan mode). `--no-plan` is still passed and does not enforce the barrier; a headless run ignores it.
 
 Raw slash-command arguments: `$ARGUMENTS`
 

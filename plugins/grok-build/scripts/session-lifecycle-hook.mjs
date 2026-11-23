@@ -511,6 +511,14 @@ async function handleSessionEnd(input, startedAt) {
 }
 
 async function main() {
+  // Grok 1.0.52 runs this hook inside every bridge-launched session
+  // (measured 2026-10-15). SessionEnd falls back to GROK_CC_SESSION_ID, the Claude
+  // session id, when the payload has no session_id, which would cancel every active
+  // job of that session. The grok child sets the marker (lib/grok.mjs). Exit before
+  // any read, write or update check.
+  if (process.env.GROK_CC_BRIDGE_CHILD === "1") {
+    process.exit(0);
+  }
   const startedAt = Date.now();
   const input = readHookInput();
   const eventName = process.argv[2] ?? input.hook_event_name ?? "";
@@ -555,7 +563,7 @@ async function main() {
 // ⚠ Compare against the REALPATH, not `path.resolve` alone. `path.resolve` normalises but does
 // not resolve links, while `import.meta.url` is the realpath Node loaded — so behind a symlink
 // or a Windows junction the two differ, the guard reads false, and the hook silently does
-// nothing on every SessionStart. That is F14 exactly, the shape that made `grok-bridge.mjs`
+// nothing on every SessionStart. That is exactly the shape that made `grok-bridge.mjs`
 // exit 0 having done nothing, and it is far worse here than the hang it replaces: a hook that
 // no-ops leaves CLAUDE_PLUGIN_DATA unset and every run billing to an invisible state root.
 // `path.resolve` stays only as the fallback for a path that cannot be realpath'd at all.

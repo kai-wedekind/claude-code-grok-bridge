@@ -41,14 +41,48 @@ export function resolveGrokBinary(env = process.env) {
   return DEFAULT_BINARY;
 }
 
+/**
+ * The environment of every grok process the bridge starts: the bridge-child marker and
+ * Grok's memory switched off.
+ *
+ * Memory is off because a bridge run is a self-contained job, and memory makes it depend on
+ * runs nobody handed it. With memory on —
+ * which xAI can switch on through remote settings without the user doing anything — a run can
+ * store what it saw, a connector run's calendar results included, and inject it into later
+ * unrelated runs in that workspace, and the capture and Dream calls behind it never reach the
+ * run's usage envelope. `GROK_MEMORY=0` turns off both memory implementations for the whole
+ * process, and the `/memory` toggle cannot turn it back on (cli-1.0.45
+ * `crates/codegen/xai-grok-config-types/src/memory.rs:577-578, 675-700`).
+ *
+ * A GROK_MEMORY the user set, to any value, is left alone. `GROK_` reaches the child
+ * (lib/process.mjs), so setting it is how to opt back in. Windows names are case-insensitive,
+ * so there any casing counts as set; adding a second spelling would put two entries for one
+ * variable into the child's environment block.
+ */
+export function bridgeChildEnv(env, platform = process.platform) {
+  const memorySet = Object.keys(env).some(
+    (key) =>
+      env[key] != null &&
+      (platform === "win32" ? key.toUpperCase() === "GROK_MEMORY" : key === "GROK_MEMORY")
+  );
+  return { ...env, GROK_CC_BRIDGE_CHILD: "1", ...(memorySet ? {} : { GROK_MEMORY: "0" }) };
+}
+
 export function runGrok(args = [], options = {}) {
   const binary = options.binary ?? resolveGrokBinary(options.env ?? process.env);
   return runCommand(binary, args, {
     cwd: options.cwd,
-    env: options.env,
+    // The same marker as the headless spawn. `check --verify-tools` starts a
+    // real model session through here, and on grok 1.0.52 this plugin's hooks run inside it
+    // Copied, so process.env is not mutated.
+    // Memory goes off here too: that session is a bridge-launched session like any other.
+    env: bridgeChildEnv(options.env ?? process.env),
     input: options.input,
     maxBuffer: options.maxBuffer,
-    stdio: options.stdio
+    stdio: options.stdio,
+    // `check --verify-tools` passes a two-minute bound, and it has to reach the runner, or the
+    // probe can hang `check` indefinitely.
+    timeoutMs: options.timeoutMs
   });
 }
 
@@ -160,6 +194,22 @@ export function runModelsProbe(cwd, options = {}) {
   // Default model: … / Available models: …" and carries none of the hints. The observed
   // failure string carries exactly one — so the two-hint rule would have missed the very
   // case that produced this comment.
+  //
+  // That one-hint scan also matches the ApiKey success banner, which is
+  // the line "You are using XAI_API_KEY." (cli-1.0.45 xai-grok-pager/src/models.rs:12).
+  // A machine signed in with an API key was reported signed out, and the remedy told the
+  // user to set the variable they had already set. The four success first lines are
+  // decided before any hint is counted.
+  if (modelsProbeSignedIn(stdout)) {
+    return buildAuthStatus({
+      available: true,
+      loggedIn: true,
+      detail: firstLine(stdout) || "grok models succeeded",
+      source: "models-probe",
+      authMethod: "grok-cli",
+      verified: true
+    });
+  }
   if (looksLikeAuthFailure(stdout, { minHints: 1 })) {
     return buildAuthStatus({
       available: true,
@@ -202,6 +252,33 @@ function firstLine(text) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean);
+}
+
+function stderrHasExactLine(stderr, exact) {
+  return String(stderr ?? "")
+    .split(/\r?\n/)
+    .some((line) => line.trim() === exact);
+}
+
+/**
+ * `grok models` success banners. The host and the model id are interpolated; the other
+ * two lines are exact. cli-1.0.45 xai-grok-pager/src/models.rs:12-17.
+ */
+function modelsProbeSignedIn(stdout) {
+  const line = firstLine(stdout);
+  if (!line) {
+    return false;
+  }
+  if (line === "You are using XAI_API_KEY.") {
+    return true;
+  }
+  if (line === "You are authenticated via deployment key.") {
+    return true;
+  }
+  if (/^You are logged in with .+\.$/.test(line)) {
+    return true;
+  }
+  return /^Model '.+' is using its own API key\.$/.test(line);
 }
 
 function emitProgress(onProgress, message, phase = null, extra = {}) {
@@ -247,6 +324,9 @@ function buildHeadlessArgs(prompt, options = {}) {
   if (options.sandbox) {
     args.push("--sandbox", options.sandbox);
   }
+  // A headless run ignores this. The only consumer is the TUI
+  // (event_loop.rs:1116); HeadlessOptions has no plan field (headless.rs:53-95). Still
+  // passed: harmless, and it keeps parity with the TUI.
   if (options.noPlan) {
     args.push("--no-plan");
   }
@@ -257,6 +337,9 @@ function buildHeadlessArgs(prompt, options = {}) {
   }
   for (const rule of options.denyRules ?? []) {
     args.push("--deny", String(rule));
+  }
+  for (const rule of options.allowRules ?? []) {
+    args.push("--allow", String(rule));
   }
   if (options.maxTurns) {
     args.push("--max-turns", String(options.maxTurns));
@@ -421,9 +504,16 @@ export async function runHeadlessAgent(cwd, options = {}) {
   // Hand long prompts over as a file instead of on the command line: Windows caps a
   // command line at ~32k, which is how large review/critique contexts used to die with
   // ENAMETOOLONG before the prompt ever reached the model.
+  //
+  // A short prompt whose first character is "-" has the same problem
+  // for a different reason. `--single` / `-p` has no allow_hyphen_values
+  // (cli-1.0.45 xai-grok-pager/src/app/cli.rs:471-479), so clap reads "- item" as a
+  // flag and the run dies at argv parse. The prompt-file path already exists for the
+  // long-prompt case and never puts the text on the command line.
   let promptFile = options.promptFile ?? null;
   let promptFileIsTemporary = false;
-  if (!promptFile && prompt.length > PROMPT_ARGV_LIMIT) {
+  const promptLeadsWithDash = prompt.startsWith("-");
+  if (!promptFile && (prompt.length > PROMPT_ARGV_LIMIT || promptLeadsWithDash)) {
     promptFile = path.join(os.tmpdir(), `grok-cc-prompt-${crypto.randomUUID()}.txt`);
     try {
       // Mode at creation (not a post-write chmod): on multi-user POSIX hosts the
@@ -438,12 +528,13 @@ export async function runHeadlessAgent(cwd, options = {}) {
       // documentation promises long prompts travel as a file; when that is impossible,
       // saying so is the honest answer.
       promptFile = null;
-      throw new Error(
-        `Prompt is ${prompt.length} characters, above the ${PROMPT_ARGV_LIMIT}-character command-line ` +
+      const why = promptLeadsWithDash && prompt.length <= PROMPT_ARGV_LIMIT
+        ? `Prompt starts with "-" and cannot be passed as -p, because the CLI would read it as a flag, so it has to be handed over as a file — and the temporary file could not be written: ${error?.message ?? error}.`
+        : `Prompt is ${prompt.length} characters, above the ${PROMPT_ARGV_LIMIT}-character command-line ` +
           `limit, so it has to be handed over as a file — and the temporary file could not be ` +
           `written: ${error?.message ?? error}. Free space in the temp directory, or pass ` +
-          `--prompt-file with a path you can write.`
-      );
+          `--prompt-file with a path you can write.`;
+      throw new Error(why);
     }
   }
   const cleanupPromptFile = () => {
@@ -545,8 +636,15 @@ export async function runHeadlessAgent(cwd, options = {}) {
       // Spawn the resolved executable when we have one: no shell, hence no Windows
       // ShellExecute fallback ("Select an app to open 'grok'").
       const childEnvSource = options.env ?? process.env;
-      const childEnv =
+      const sanitized =
         options.sanitizeEnv === false ? childEnvSource : sanitizeChildEnv(childEnvSource);
+      // Grok 1.0.52 loads this plugin and runs its SessionStart/SessionEnd
+      // inside the session this spawn starts (measured 2026-10-15). The marker is how
+      // session-lifecycle-hook.mjs tells that invocation from a Claude Code one. GROK_ is
+      // on sanitizeChildEnv's prefix allowlist (lib/process.mjs). Copied so a caller-supplied
+      // env object, including process.env, is not mutated. bridgeChildEnv also turns Grok's
+      // memory off for the run unless the user set GROK_MEMORY.
+      const childEnv = bridgeChildEnv(sanitized);
       const executable = resolveExecutable(binary, childEnvSource);
       if (!executable && isBareCommandName(binary) && !bareNameSpawnIsSafe(platform)) {
         // Windows resolves a bare name against the current directory before PATH, and the
@@ -812,10 +910,25 @@ export async function runHeadlessAgent(cwd, options = {}) {
         { threadId: sessionId, agentPid }
       );
       const wantsJson = (options.outputFormat ?? null) === "json";
-      // Classify a fatal CLI error before the envelope logic: an exhausted allowance is
-      // not a generic failure, and the error payload carries the usage already spent.
-      // stdout only: the CLI writes its fatal error envelope there, and the stderr
-      // accumulator is not initialised yet at this point in the close handler.
+      // The result envelope has to be known before the auth scan. A non-error envelope
+      // is the model's own text (or the CLI's result object). Scanning it for
+      // "grok login" and "XAI_API_KEY" would file a partial review as not-authenticated.
+      const {
+        envelope,
+        parsed: envelopeParsed,
+        isEnvelope = false
+      } = wantsJson ? parseCliEnvelope(stdout) : { envelope: null, parsed: false, isEnvelope: false };
+      const nonErrorEnvelope = isEnvelope && envelope?.type !== "error";
+      // --max-turns exhaustion writes that envelope (stopReason "cancelled"), then
+      // "Error: max turns reached" on stderr, and exits 1.
+      // cli-1.0.45 headless.rs:1397-1406, xai-grok-pager-bin main.rs:2120-2128.
+      const maxTurns =
+        status !== 0 && nonErrorEnvelope && stderrHasExactLine(stderr, "Error: max turns reached");
+      // Classify a fatal CLI error before treating the run as a generic failure: an
+      // exhausted allowance is not a generic failure, and the error payload carries the
+      // usage already spent.
+      // stdout only: the CLI writes its fatal error envelope there. (stderr is complete by
+      // now — the max-turns check above reads it — but it carries no envelope.)
       // A fatal envelope on exit 0 counts as a failure too — see findFatalErrorEnvelope.
       // Without this the allowance-exhausted payload's `promptUsage` is dropped whenever
       // the CLI forgets to set an exit code, and the tokens already spent on the refused
@@ -841,16 +954,30 @@ export async function runHeadlessAgent(cwd, options = {}) {
       // So emit a second progress line once the cause is known. It is not a retry and not
       // a new state; it replaces a sentence that was true but useless with one that tells
       // the reader what to do next.
-      if (cliError?.quotaExhausted) {
+      if (maxTurns) {
         emitProgress(
           options.onProgress,
-          "Grok refused the run: the account's usage balance is exhausted (HTTP 402). " +
+          "Grok ran out of turns before finishing. The text so far is kept. " +
+            "Raising --max-turns or narrowing the task is what changes the outcome; " +
+            "running it again hits the same limit.",
+          "failed",
+          { threadId: sessionId, agentPid }
+        );
+      } else if (cliError?.quotaExhausted) {
+        const statusNote = cliError.httpStatus === 402
+          ? " (HTTP 402)"
+          : cliError.httpStatus === 403
+            ? " (HTTP 403)"
+            : "";
+        emitProgress(
+          options.onProgress,
+          `Grok refused the run: the account's usage balance is exhausted${statusNote}. ` +
             "Retrying cannot help until the allowance resets or credit is added. " +
             "The tokens this attempt already spent are recorded on the run.",
           "failed",
           { threadId: sessionId, agentPid }
         );
-      } else if (cliFailed && looksLikeAuthFailure(stdout)) {
+      } else if (cliFailed && !nonErrorEnvelope && looksLikeAuthFailure(stdout)) {
         emitProgress(
           options.onProgress,
           "Grok refused the run: nobody is signed in. Sign in with `grok login " +
@@ -859,11 +986,6 @@ export async function runHeadlessAgent(cwd, options = {}) {
           { threadId: sessionId, agentPid }
         );
       }
-      const {
-        envelope,
-        parsed: envelopeParsed,
-        isEnvelope = false
-      } = wantsJson ? parseCliEnvelope(stdout) : { envelope: null, parsed: false, isEnvelope: false };
       const envelopeHasText = Boolean(envelope) && typeof envelope.text === "string";
       // Real envelopes without `text` carry no text deliverable. Non-envelope JSON
       // (schema-only stdout, concatenated objects) must fall back to raw stdout so the
@@ -910,16 +1032,22 @@ export async function runHeadlessAgent(cwd, options = {}) {
         usage: isEnvelope ? (envelope?.usage ?? null) : (cliError?.usage ?? null),
         // Set when the run failed for a reason worth naming; the bridge maps it to a
         // failureCode so a caller can tell "retry later" from "retrying cannot help".
-        failureKind: cliError?.quotaExhausted
-          ? "quota-exhausted"
-          : cliFailed && looksLikeAuthFailure(stdout)
-            ? "not-authenticated"
-            : null,
+        // max-turns wins over a quota or auth reading of the same stdout: the envelope
+        // is the model's partial text, and the stderr line is the CLI's own reason.
+        failureKind: maxTurns
+          ? "max-turns"
+          : cliError?.quotaExhausted
+            ? "quota-exhausted"
+            : cliFailed && !nonErrorEnvelope && looksLikeAuthFailure(stdout)
+              ? "not-authenticated"
+              : null,
         failureDetail: cliError?.message ?? null,
         // The CLI reports what this run cost; keeping it is what makes a local budget
         // report possible at all (subscriptions expose no usage endpoint).
         costUsd:
-          isEnvelope && typeof envelope?.total_cost_usd === "number" ? envelope.total_cost_usd : null,
+          isEnvelope && typeof envelope?.total_cost_usd === "number"
+            ? envelope.total_cost_usd
+            : (typeof cliError?.costUsd === "number" ? cliError.costUsd : null),
         // Exact integer ticks, 1 USD = 10^10. The CLI's own documentation says summing
         // these matches the server's usage export exactly and that float dollars cannot
         // guarantee that — so a ledger built for calibration has to add up the ticks.
@@ -927,11 +1055,16 @@ export async function runHeadlessAgent(cwd, options = {}) {
           isEnvelope && Number.isInteger(envelope?.total_cost_usd_ticks)
             ? envelope.total_cost_usd_ticks
             : (cliError?.costTicks ?? null),
-        // Set when subagent usage could not be applied or a drain timed out. The cost
-        // fields are then omitted, and token totals may under-count: a run like this is
-        // not a zero-cost run, it is an unmeasured one, and the report has to say so.
-        usageIncomplete: isEnvelope ? envelope?.usage_is_incomplete === true : false,
-        modelUsage: isEnvelope ? (envelope?.modelUsage ?? null) : null,
+        // Set when subagent usage could not be applied, a drain timed out, or the CLI
+        // withheld the cost on purpose (`cost_is_partial`). The cost fields are then
+        // omitted, and token totals may under-count: a run like this is not a zero-cost
+        // run, it is an unmeasured one, and the report has to say so.
+        // On a fatal error the same flags arrive at the top level
+        // of the error object (headless.rs:351-359), not only on a success envelope.
+        usageIncomplete: isEnvelope
+          ? envelope?.usage_is_incomplete === true || envelope?.cost_is_partial === true
+          : cliError?.usageIncomplete === true,
+        modelUsage: isEnvelope ? (envelope?.modelUsage ?? null) : (cliError?.modelUsage ?? null),
         args,
         binary
       });
@@ -1025,59 +1158,152 @@ export function findFatalErrorEnvelope(rawOutput) {
   return parsed?.type === "error" && typeof parsed.message === "string" ? parsed : null;
 }
 
-export function parseCliErrorPayload(rawOutput) {
-  const text = String(rawOutput ?? "").trim();
-  if (!text.includes("http_status") && !text.includes("balance exhausted")) {
+// cli-1.0.45 xai-grok-shell/src/sampling/error.rs:29 and :33. The apostrophe is U+2019,
+// the same character the CLI interpolates. A rewritten -32003 message is this sentence;
+// the code string is what the CLI sniffs in the plain-string error data before rewriting.
+const FREE_USAGE_EXHAUSTED_ERROR_CODE = "subscription:free-usage-exhausted";
+const FREE_USAGE_USER_MESSAGE =
+  "You\u2019ve reached your free Grok Build usage limit for now. Get SuperGrok for much higher limits, or try again later: https://grok.com/supergrok?referrer=grok-build";
+
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+/**
+ * Headless attaches its spend projection on the error object itself, with uncached
+ * `usage.input_tokens`. cli-1.0.45 headless.rs:351-359 via notification.rs:364-391.
+ * Absent when the fatal error never reached that attach.
+ */
+function headlessErrorProjection(outer) {
+  if (!outer || typeof outer !== "object") {
     return null;
   }
-
-  let detail = null;
-  const outer = scanJsonObjects(text).find((candidate) => candidate?.type === "error");
-  const message = typeof outer?.message === "string" ? outer.message : text;
-  for (const candidate of scanJsonObjects(message)) {
-    if (candidate && typeof candidate === "object" && "http_status" in candidate) {
-      detail = candidate;
-      break;
-    }
-  }
-  if (!detail) {
+  const hasUsage = outer.usage && typeof outer.usage === "object" && !Array.isArray(outer.usage);
+  const hasProjection =
+    hasUsage ||
+    outer.usage_is_incomplete === true ||
+    outer.cost_is_partial === true ||
+    Number.isInteger(outer.num_turns) ||
+    Number.isInteger(outer.total_cost_usd_ticks) ||
+    typeof outer.total_cost_usd === "number";
+  if (!hasProjection) {
     return null;
   }
-
-  const usage = detail.promptUsage ?? null;
   return {
-    httpStatus: Number.isFinite(Number(detail.http_status)) ? Number(detail.http_status) : null,
-    message: typeof detail.message === "string" ? detail.message : message,
-    quotaExhausted:
-      Number(detail.http_status) === 402 || /balance exhausted/i.test(String(detail.message ?? "")),
-    usage: usage
+    usage: hasUsage
       ? {
-          input_tokens: usage.inputTokens ?? 0,
-          output_tokens: usage.outputTokens ?? 0,
-          reasoning_tokens: usage.reasoningTokens ?? 0,
-          cache_read_input_tokens: usage.cachedReadTokens ?? 0,
-          total_tokens: usage.totalTokens ?? 0
+          input_tokens: outer.usage.input_tokens ?? 0,
+          output_tokens: outer.usage.output_tokens ?? 0,
+          reasoning_tokens: outer.usage.reasoning_tokens ?? 0,
+          cache_read_input_tokens: outer.usage.cache_read_input_tokens ?? 0,
+          cache_creation_input_tokens: outer.usage.cache_creation_input_tokens ?? 0,
+          total_tokens: outer.usage.total_tokens ?? 0
         }
       : null,
-    costTicks: Number.isInteger(usage?.costUsdTicks) ? usage.costUsdTicks : null,
-    // The CLI reports the turn count inside the error payload too, and dropping it here
-    // was losing it exactly where it is hardest to get again. Measured 2026-08-02 on a
-    // real 402: `promptUsage.numTurns` and `num_turns` both said 1, and the job record
-    // still showed `numTurns: null`, because the envelope path is the only one that read
-    // it and a fatal error produces no envelope. Turn count is the live diagnostic for
-    // whether a run did any work before it stopped; a failure path is the worst place to
-    // have it missing.
-    // Both spellings on the outer object, because the chain reached only one of them: the
-    // captured fixtures happen to carry `promptUsage.numTurns`, so a payload that put a
-    // camelCase `numTurns` on the detail and no usage block would have stored null while
-    // the count sat right there. Cheap to accept, and nothing else distinguishes them.
-    numTurns: Number.isFinite(Number(usage?.numTurns))
-      ? Number(usage.numTurns)
-      : Number.isFinite(Number(detail?.num_turns))
-        ? Number(detail.num_turns)
-        : Number.isFinite(Number(detail?.numTurns))
-          ? Number(detail.numTurns)
-          : null
+    costTicks: Number.isInteger(outer.total_cost_usd_ticks) ? outer.total_cost_usd_ticks : null,
+    costUsd: typeof outer.total_cost_usd === "number" ? outer.total_cost_usd : null,
+    numTurns: finiteNumber(outer.num_turns),
+    usageIncomplete: outer.usage_is_incomplete === true || outer.cost_is_partial === true,
+    modelUsage: outer.modelUsage ?? null
+  };
+}
+
+function promptUsageProjection(usage) {
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+  return {
+    usage: {
+      input_tokens: usage.inputTokens ?? 0,
+      output_tokens: usage.outputTokens ?? 0,
+      reasoning_tokens: usage.reasoningTokens ?? 0,
+      cache_read_input_tokens: usage.cachedReadTokens ?? 0,
+      total_tokens: usage.totalTokens ?? 0
+    },
+    costTicks: Number.isInteger(usage.costUsdTicks) ? usage.costUsdTicks : null,
+    numTurns: finiteNumber(usage.numTurns),
+    // promptUsage keeps the camelCase flags the ACP error carries. Either one means
+    // the CLI withheld a complete bill.
+    usageIncomplete: usage.usageIsIncomplete === true || usage.costIsPartial === true
+  };
+}
+
+export function parseCliErrorPayload(rawOutput) {
+  const text = String(rawOutput ?? "").trim();
+  const outer = scanJsonObjects(text).find((candidate) => candidate?.type === "error");
+  const message = typeof outer?.message === "string" ? outer.message : "";
+  let detail = null;
+  if (message) {
+    for (const candidate of scanJsonObjects(message)) {
+      if (candidate && typeof candidate === "object" && ("http_status" in candidate || candidate.promptUsage)) {
+        detail = candidate;
+        break;
+      }
+    }
+  }
+  const projected = headlessErrorProjection(outer);
+  const fromPrompt = promptUsageProjection(detail?.promptUsage);
+  if (!outer && !detail) {
+    return null;
+  }
+
+  const detailMessage = typeof detail?.message === "string" ? detail.message : "";
+  const httpStatus = finiteNumber(detail?.http_status);
+  const combined = `${message}\n${detailMessage}`;
+  // 402 is the measured allowance refusal. Free-usage exhaustion arrives as the
+  // rewritten user message (or the code string, if the rewrite did not run).
+  // A 403 counts only with the legacy credit wording — other 403s are not quota.
+  // cli-1.0.45 error.rs:29-33, headless.rs:1413-1418, billing.rs:60-71.
+  const quotaExhausted = Boolean(
+    httpStatus === 402 ||
+      /balance exhausted/i.test(detailMessage) ||
+      /balance exhausted/i.test(message) ||
+      (httpStatus === 403 && /run out of credits/i.test(combined)) ||
+      combined.includes(FREE_USAGE_EXHAUSTED_ERROR_CODE) ||
+      message === FREE_USAGE_USER_MESSAGE ||
+      detailMessage === FREE_USAGE_USER_MESSAGE
+  );
+  // An auth envelope is type "error" and carries none of this. Returning an object
+  // for it would put the remedy text into failureDetail and change a path that
+  // already classifies itself from the hints. Only a payload with a status, a quota
+  // sentence, or a spend projection is this function's business.
+  if (!projected && !fromPrompt && httpStatus == null && !quotaExhausted) {
+    return null;
+  }
+
+  const usage = projected?.usage ?? fromPrompt?.usage ?? null;
+  // The projection is authoritative when it is present, including when it omitted the
+  // ticks. Falling through to promptUsage would record a bill `cost_is_partial` withheld.
+  // cli-1.0.45 notification.rs:377-392.
+  const costTicks = projected ? projected.costTicks : (fromPrompt?.costTicks ?? null);
+  // The CLI reports the turn count inside the error payload too, and dropping it here
+  // was losing it exactly where it is hardest to get again. Measured 2026-08-02 on a
+  // real 402: `promptUsage.numTurns` and `num_turns` both said 1, and the job record
+  // still showed `numTurns: null`, because the envelope path is the only one that read
+  // it and a fatal error produces no envelope. Turn count is the live diagnostic for
+  // whether a run did any work before it stopped; a failure path is the worst place to
+  // have it missing.
+  // Both spellings on the detail object, because the chain reached only one of them: the
+  // captured fixtures happen to carry `promptUsage.numTurns`, so a payload that put a
+  // camelCase `numTurns` on the detail and no usage block would have stored null while
+  // the count sat right there. The headless projection's `num_turns` wins when it is
+  // present, because that is the uncached bill the CLI attached on purpose.
+  const numTurns = projected?.numTurns
+    ?? fromPrompt?.numTurns
+    ?? finiteNumber(detail?.num_turns)
+    ?? finiteNumber(detail?.numTurns);
+
+  return {
+    httpStatus,
+    message: detailMessage || message,
+    quotaExhausted,
+    usage,
+    costTicks,
+    costUsd: projected?.costUsd ?? null,
+    numTurns,
+    usageIncomplete: projected?.usageIncomplete === true || fromPrompt?.usageIncomplete === true,
+    modelUsage: projected?.modelUsage ?? null
   };
 }
 

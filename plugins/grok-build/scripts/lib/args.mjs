@@ -35,7 +35,12 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      // First "=" only. `split("=", 2)` drops the remainder, so `--cwd=/srv/app=prod`
+      // became `/srv/app` (upstream #55, 2026-10-24).
+      const body = token.slice(2);
+      const equals = body.indexOf("=");
+      const rawKey = equals === -1 ? body : body.slice(0, equals);
+      const inlineValue = equals === -1 ? undefined : body.slice(equals + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
       if (booleanOptions.has(key)) {
@@ -102,6 +107,9 @@ export function splitRawArgumentString(raw) {
   let current = "";
   let quote = null;
   let escaping = false;
+  // A quoted span is a token even when it is empty, as a shell would do. Dropping it
+  // turned `--base "" focus` into `--base focus` (upstream #55, 2026-10-24).
+  let quoted = false;
 
   for (const character of raw) {
     if (escaping) {
@@ -137,13 +145,15 @@ export function splitRawArgumentString(raw) {
 
     if (character === "'" || character === "\"") {
       quote = character;
+      quoted = true;
       continue;
     }
 
     if (/\s/.test(character)) {
-      if (current) {
+      if (current || quoted) {
         tokens.push(current);
         current = "";
+        quoted = false;
       }
       continue;
     }
@@ -155,7 +165,7 @@ export function splitRawArgumentString(raw) {
     current += "\\";
   }
 
-  if (current) {
+  if (current || quoted) {
     tokens.push(current);
   }
 

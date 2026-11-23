@@ -40,6 +40,10 @@ Everything in `second-opinion`, plus:
 - **X/Twitter.** Claude has no access; Grok does. Live search there is a research instrument in its own right, not merely offloading.
 - **Keeping bulk out of your context.** A long log, a big document, a wide sweep across a repository: the gain is not the other model, it is that the content never enters your context window at all. Below roughly 2000–3000 tokens of input this loses — the call itself costs more than it saves. Read it yourself.
 
+### Connectors — what only the user's Grok account can reach
+
+Independent of the tiers: `run --connector <name>[,<name>…]` lets Grok use a connector the user signed in to on the Grok side — Google Calendar, Notion, GitHub, whatever their account has. The point is that the **login stays inside the Grok CLI**: you get the calendar into the task without Claude Code ever holding the credential. The bridge pre-approves only the named connectors, and a named one is fully open, including tools that create, send or delete — but the user's own permission settings (Grok config, Claude Code settings, saved "Always allow" answers) can open more, so treat the named list as the least that is open, not the most. Use it only when the user asked for work in that connector, name only the connectors the task needs, and say in the prompt what may and may not be changed. The bridge already tells Grok to keep calling `search_tool` until the connector catalog has loaded; you do not need to repeat that. Foreground only; never with `--write`. The result does not show which tools Grok called, so treat its account of what it read or changed as a claim, and when a change matters, check it in the connector itself.
+
 ### `offload-first` — fire the read-only slices before you start
 
 Everything above, plus: decompose the task first, send the read-only slices immediately, and work locally while they run.
@@ -73,7 +77,7 @@ Two things that will otherwise mislead you:
 
 ## Failure codes worth knowing
 
-`no-deliverable` (ran, produced nothing), `schema-parse` (output present but unusable), `quota-exhausted` and `not-authenticated` (retrying cannot help — the second is the one people waste an hour debugging as a schema problem), `timeout`, `output-truncated`. The full table with exit codes is in the plugin README.
+`no-deliverable` (ran, produced nothing), `schema-parse` (output present but unusable), `quota-exhausted` and `not-authenticated` (retrying cannot help — the second is the one people waste an hour debugging as a schema problem), `max-turns` (the run hit `--max-turns`; the partial text is kept, and only a higher limit or a narrower task changes the outcome), `timeout`, `output-truncated`, `connector-unavailable` (a connector run whose catalog never loaded — nothing reached the connector, so running it again is safe), and `connector-refused` (a call outside the `--connector` list was refused and ended the run — running it again only repeats the refusal). The full table with exit codes is in the plugin README.
 
 ## The one thing this skill cannot do for you
 

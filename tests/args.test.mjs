@@ -42,3 +42,33 @@ test("parseArgs can warn on unknown long options without treating them as positi
   assert.deepEqual(result.positionals, ["working-tree", "focus text"]);
   assert.equal(result.options.scope, undefined);
 });
+
+test("parseArgs keeps text after the first '=' in --key=value", () => {
+  const result = parseArgs(["--cwd=/srv/app=prod", "--json=false", "--prompt-file=./runs/id=42.md"], {
+    valueOptions: ["cwd", "prompt-file"],
+    booleanOptions: ["json"]
+  });
+  assert.equal(result.options.cwd, "/srv/app=prod");
+  assert.equal(result.options["prompt-file"], "./runs/id=42.md");
+  assert.equal(result.options.json, false);
+});
+
+test("splitRawArgumentString keeps an explicitly quoted empty token", () => {
+  assert.deepEqual(splitRawArgumentString(`--base "" focus`), ["--base", "", "focus"]);
+  assert.deepEqual(splitRawArgumentString(`''`), [""]);
+  assert.deepEqual(splitRawArgumentString(`a   b`), ["a", "b"]);
+
+  const parsed = parseArgs(splitRawArgumentString(`--base "" focus`), {
+    valueOptions: ["base"]
+  });
+  assert.equal(parsed.options.base, "");
+  assert.deepEqual(parsed.positionals, ["focus"]);
+});
+
+test("splitRawArgumentString keeps a backslash that is not a quote, space, or backslash", () => {
+  // The fork's splitter, not a POSIX shell: these must stay intact. `keep\ going` is the
+  // one escape that drops the backslash, and it already has its own test above.
+  assert.deepEqual(splitRawArgumentString(String.raw`C:\Users\me\app`), [String.raw`C:\Users\me\app`]);
+  assert.deepEqual(splitRawArgumentString(String.raw`\d+`), [String.raw`\d+`]);
+  assert.deepEqual(splitRawArgumentString(String.raw`keep\\going`), [String.raw`keep\going`]);
+});

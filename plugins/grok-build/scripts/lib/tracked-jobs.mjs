@@ -38,7 +38,9 @@ export function nowIso() {
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const agentPidRaw = value.agentPid ?? null;
-    const agentPid = Number.isFinite(Number(agentPidRaw)) ? Number(agentPidRaw) : null;
+    // `Number(null)` is 0, so a missing pid is mapped to null here rather than reaching onEvent
+    // as pid 0 (upstream #70).
+    const agentPid = agentPidRaw != null && Number.isFinite(Number(agentPidRaw)) ? Number(agentPidRaw) : null;
     return {
       message: String(value.message ?? "").trim(),
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
